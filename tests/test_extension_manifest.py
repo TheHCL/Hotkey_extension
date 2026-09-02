@@ -53,7 +53,7 @@ def test_popup_js_uses_chrome_apis() -> None:
 def test_background_js_connects_native() -> None:
     js = (EXT_DIR / "background.js").read_text(encoding="utf-8")
     assert "connectNative" in js
-    assert '"com.danielhsieh.pwmgr"' in js
+    assert '"com.thehcl.pwmgr"' in js
     assert 'type: "query"' in js
     assert 'type: "report_url"' in js
     assert 'type: "fetch"' in js

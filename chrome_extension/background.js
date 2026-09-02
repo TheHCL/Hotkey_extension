@@ -1,10 +1,10 @@
 // PWmgr Companion — service worker (MV3)
 // 職責:
-//   1. 與原生主機 (com.danielhsieh.pwmgr) 保持長連線
+//   1. 與原生主機 (com.thehcl.pwmgr) 保持長連線
 //   2. tab URL 變動 → query + report_url
 //   3. 收到 query 命中 → 設 badge;popup 點選 → fetch + 注入 content script 填表
 
-const HOST_NAME = "com.danielhsieh.pwmgr";
+const HOST_NAME = "com.thehcl.pwmgr";
 const BADGE_COLOR = "#0078d4";
 
 let nativePort = null;

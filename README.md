@@ -87,7 +87,7 @@ python install.py
 
 1. 檢查相依套件
 2. 寫入 `bin/native_host.bat`(用 `pythonw.exe` 啟動,無 console 視窗)
-3. 寫入 `bin/com.danielhsieh.pwmgr.json`(Chrome/Edge 原生主機 manifest)
+3. 寫入 `bin/com.thehcl.pwmgr.json`(Chrome/Edge 原生主機 manifest)
 4. **互動式**要求貼上 Extension ID(此時請先到 [瀏覽器擴充功能](#瀏覽器擴充功能) 步驟取得 ID)
 5. 註冊 Windows 登錄(Edge + Chrome 兩條)
 6. 建立開始功能表捷徑
@@ -259,7 +259,7 @@ GUI 每 2 秒輪詢,把符合的條目標 ★。
 
 1. 確認擴充功能已啟用(Edge / Chrome 的擴充管理頁)
 2. 打開 `edge://extensions` → 點 PWmgr → 「檢查視圖:背景頁」→ 看 console 錯誤
-3. 確認 `bin\com.danielhsieh.pwmgr.json` 的 `allowed_origins` 包含當前擴充 ID
+3. 確認 `bin\com.thehcl.pwmgr.json` 的 `allowed_origins` 包含當前擴充 ID
 4. 重新執行 `python install.py`,貼上正確的 ID
 
 ### 「點 popup 沒反應 / 顯示忙碌」
@@ -289,8 +289,8 @@ python uninstall.py
 
 或手動:
 1. 從 tray 退出 GUI
-2. `reg delete HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.danielhsieh.pwmgr /f`
-3. `reg delete HKCU\Software\Google\Chrome\NativeMessagingHosts\com.danielhsieh.pwmgr /f`
+2. `reg delete HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thehcl.pwmgr /f`
+3. `reg delete HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thehcl.pwmgr /f`
 4. 從 Edge / Chrome 擴充頁移除 PWmgr
 5. 刪 `bin\`、`%LOCALAPPDATA%\pwmgr\`、Credential Manager 中的 `pwmgr*` 條目
 

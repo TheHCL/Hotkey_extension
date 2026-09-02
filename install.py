@@ -3,11 +3,11 @@
 執行 `python install.py` 會:
 1. 檢查相依套件(keyring、pystray、Pillow)。
 2. 寫入 `bin/native_host.bat`(用 pythonw.exe 啟動,避免 console 視窗)。
-3. 寫入 `bin/com.danielhsieh.pwmgr.json`(Chrome/Edge 原生主機 manifest)。
+3. 寫入 `bin/com.thehcl.pwmgr.json`(Chrome/Edge 原生主機 manifest)。
 4. 提示貼上 Extension ID,然後重寫 manifest 的 allowed_origins。
 5. 寫入登錄:
-   - HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.danielhsieh.pwmgr
-   - HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.danielhsieh.pwmgr
+   - HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.thehcl.pwmgr
+   - HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.thehcl.pwmgr
 6. 建立開始功能表捷徑(GUI 常駐)。
 
 設計成可重入——Extension ID 或 Python 路徑變動時直接重跑即可。

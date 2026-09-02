@@ -8,7 +8,7 @@ from pathlib import Path
 
 # --- native messaging -------------------------------------------------------
 
-HOST_NAME = "com.danielhsieh.pwmgr"
+HOST_NAME = "com.thehcl.pwmgr"
 
 # --- 儲存路徑 ---------------------------------------------------------------
 
