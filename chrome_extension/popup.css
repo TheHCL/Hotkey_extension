@@ -1,0 +1,108 @@
+body {
+  font-family: "Segoe UI", "Microsoft JhengHei", system-ui, sans-serif;
+  font-size: 13px;
+  margin: 0;
+  padding: 0;
+  min-width: 280px;
+  max-width: 360px;
+  color: #222;
+  background: #fff;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #0078d4;
+  color: #fff;
+}
+
+.title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.conn-status {
+  font-size: 11px;
+  opacity: 0.9;
+}
+
+.conn-status.ok::before {
+  content: "● ";
+  color: #6dff6d;
+}
+
+.conn-status.bad::before {
+  content: "● ";
+  color: #ff6d6d;
+}
+
+#content {
+  padding: 8px 0;
+  min-height: 60px;
+}
+
+.hint {
+  margin: 0 12px 8px;
+  color: #666;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+#matches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#matches li {
+  padding: 8px 12px;
+  border-bottom: 1px solid #eee;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+#matches li:hover {
+  background: #f3f8ff;
+}
+
+#matches li:last-child {
+  border-bottom: none;
+}
+
+.entry-label {
+  font-weight: 600;
+  color: #222;
+}
+
+.entry-meta {
+  font-size: 11px;
+  color: #888;
+  display: flex;
+  gap: 8px;
+}
+
+.empty {
+  margin: 16px 12px;
+  color: #888;
+  font-size: 12px;
+}
+
+.empty code {
+  background: #f0f0f0;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+}
+
+footer {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #888;
+  border-top: 1px solid #eee;
+  min-height: 14px;
+}

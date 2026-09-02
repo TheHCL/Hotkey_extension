@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>PWmgr</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="title">PWmgr</span>
+    <span id="conn" class="conn-status">連線中…</span>
+  </header>
+  <div id="content">
+    <p class="hint" id="current-url"></p>
+    <ul id="matches" hidden></ul>
+    <p class="empty" id="empty" hidden>目前網頁沒有符合的條目。</p>
+    <p class="empty" id="no-host" hidden>
+      找不到原生主機。請確認 <code>python install.py</code> 已執行且擴充 ID 已註冊。
+    </p>
+  </div>
+  <footer>
+    <span id="status"></span>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>

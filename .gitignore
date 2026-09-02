@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build / dist (PyInstaller)
+build/
+dist/
+*.spec
+!PWmgr.spec
+!PWmgrSetup.spec
+
+# Packaging
+packaging/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+credentials*

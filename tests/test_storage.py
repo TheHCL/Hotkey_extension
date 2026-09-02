@@ -1,0 +1,212 @@
+"""Storage 測試——用 monkeypatch 模擬 keyring。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Iterator
+
+import pytest
+
+import pwmgr.storage as storage
+from pwmgr.config import MAX_NOTES_CHARS, MAX_PASSWORD_BYTES
+from pwmgr.models import PasswordEntry
+
+
+# --- fixtures ---------------------------------------------------------------
+
+
+class FakeKeyring:
+    """模擬 keyring,用 dict 存放。"""
+
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], str] = {}
+        self.errors = __import__("keyring").errors
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.store[(service, username)] = password
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.store.get((service, username))
+
+    def delete_password(self, service: str, username: str) -> None:
+        key = (service, username)
+        if key not in self.store:
+            raise self.errors.PasswordDeleteError("not found")
+        del self.store[key]
+
+
+@pytest.fixture
+def fake_keyring(monkeypatch) -> FakeKeyring:
+    fake = FakeKeyring()
+
+    import keyring
+    import keyring.errors
+
+    monkeypatch.setattr(keyring, "set_password", fake.set_password)
+    monkeypatch.setattr(keyring, "get_password", fake.get_password)
+    monkeypatch.setattr(keyring, "delete_password", fake.delete_password)
+    monkeypatch.setattr(keyring.errors, "PasswordDeleteError", fake.errors.PasswordDeleteError)
+    return fake
+
+
+@pytest.fixture
+def tmp_index(monkeypatch, tmp_path: Path) -> Iterator[Path]:
+    idx = tmp_path / "index.json"
+    cur = tmp_path / "current_url.json"
+    monkeypatch.setattr(storage, "index_path", lambda: idx)
+    monkeypatch.setattr(storage, "current_url_path", lambda: cur)
+    yield idx
+
+
+@pytest.fixture
+def null_locks(monkeypatch) -> None:
+    """讓 lock 變 no-op,簡化單元測試。多行程 lock 測試見 test_ipc_lock。
+
+    注意:要 patch `storage.index_lock`,因為 storage 在 import 時把名字綁定了;
+    只 patch `ipc.index_lock` 沒用。
+    """
+    from pwmgr import ipc
+
+    monkeypatch.setattr(
+        storage, "index_lock", lambda *a, **kw: ipc.NullLock(*a, **kw)
+    )
+
+
+# --- CRUD ------------------------------------------------------------------
+
+
+def test_save_and_load(fake_keyring, tmp_index, null_locks) -> None:
+    entry = PasswordEntry.new("GitHub", "github.com", "alice", notes="2FA on")
+    eid = storage.save_entry(entry, "secret")
+    assert eid == entry.id
+
+    entries = storage.load_index()
+    assert len(entries) == 1
+    assert entries[0].label == "GitHub"
+    assert entries[0].username == "alice"
+    # 密碼不在 index.json
+    assert "password" not in json.loads(tmp_index.read_text())["entries"][0]
+    # 但在 keyring
+    assert storage.get_password(eid) == "secret"
+
+
+def test_save_updates_existing(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("GH", "github.com", "alice")
+    eid = storage.save_entry(e, "old")
+    e.label = "GitHub - work"
+    e.url = "github.com"
+    storage.save_entry(e, "new")
+
+    entries = storage.load_index()
+    assert len(entries) == 1
+    assert entries[0].label == "GitHub - work"
+    assert storage.get_password(eid) == "new"
+
+
+def test_update_entry_preserves_password(fake_keyring, tmp_index, null_locks) -> None:
+    """update_entry 只改 metadata,不該動到 keyring 裡的密碼(GUI 編輯條目、密碼欄位留白時使用)。"""
+    e = PasswordEntry.new("GH", "github.com", "alice")
+    eid = storage.save_entry(e, "secret")
+
+    e.label = "GitHub - work"
+    storage.update_entry(e)
+
+    entries = storage.load_index()
+    assert entries[0].label == "GitHub - work"
+    assert storage.get_password(eid) == "secret"
+
+
+def test_delete_entry(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("GH", "github.com", "alice")
+    eid = storage.save_entry(e, "secret")
+    assert storage.delete_entry(eid) is True
+    assert storage.load_index() == []
+    assert storage.get_password(eid) is None
+    # 重複刪除回 False
+    assert storage.delete_entry(eid) is False
+
+
+def test_get_entry_not_found(fake_keyring, tmp_index, null_locks) -> None:
+    with pytest.raises(storage.EntryNotFoundError):
+        storage.get_entry("nope")
+
+
+# --- 2560 byte 限制 --------------------------------------------------------
+
+
+def test_save_rejects_oversized_password(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("GH", "github.com", "alice")
+    big = "x" * (MAX_PASSWORD_BYTES + 1)
+    with pytest.raises(storage.PasswordTooLongError):
+        storage.save_entry(e, big)
+
+
+def test_save_rejects_oversized_notes(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("GH", "github.com", "alice", notes="x" * (MAX_NOTES_CHARS + 1))
+    with pytest.raises(storage.NotesTooLongError):
+        storage.save_entry(e, "secret")
+
+
+def test_password_at_limit_accepted(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("GH", "github.com", "alice")
+    # 多位元組字元:每字 3 bytes,扣到上限內
+    pwd = "中" * (MAX_PASSWORD_BYTES // 3)
+    storage.save_entry(e, pwd)
+    assert storage.get_password(e.id) == pwd
+
+
+# --- query_by_url ----------------------------------------------------------
+
+
+def test_query_by_url_matches(fake_keyring, tmp_index, null_locks) -> None:
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "alice"), "a")
+    storage.save_entry(PasswordEntry.new("GL", "gitlab.com", "bob"), "b")
+    results = storage.query_by_url("https://github.com/login")
+    assert len(results) == 1
+    assert results[0].label == "GH"
+
+
+def test_query_by_url_subdomain_matches(fake_keyring, tmp_index, null_locks) -> None:
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "alice"), "a")
+    results = storage.query_by_url("https://api.github.com/x")
+    assert len(results) == 1
+
+
+def test_query_by_url_sorted_by_updated(fake_keyring, tmp_index, null_locks) -> None:
+    e1 = PasswordEntry.new("GH-old", "github.com", "alice")
+    storage.save_entry(e1, "a")
+    # 強制 e1 的 updated_at 早一點
+    e1.updated_at -= 100
+    storage.save_entry(e1, "a")
+
+    e2 = PasswordEntry.new("GH-new", "github.com", "alice2")
+    storage.save_entry(e2, "b")
+
+    results = storage.query_by_url("https://github.com/")
+    assert [r.label for r in results] == ["GH-new", "GH-old"]
+
+
+# --- current_url -----------------------------------------------------------
+
+
+def test_write_and_read_current_url(fake_keyring, tmp_index, null_locks) -> None:
+    storage.write_current_url("https://github.com/login", tab_id=42)
+    assert storage.read_current_url() == "https://github.com/login"
+
+
+def test_read_current_url_missing_returns_none(fake_keyring, tmp_index, null_locks) -> None:
+    assert storage.read_current_url() is None
+
+
+# --- 損壞的 index.json 備援 -----------------------------------------------
+
+
+def test_corrupted_index_recovers(fake_keyring, tmp_index, null_locks) -> None:
+    tmp_index.parent.mkdir(parents=True, exist_ok=True)
+    tmp_index.write_text("{ not json", encoding="utf-8")
+    # 不應崩潰,應回空清單
+    entries = storage.load_index()
+    assert entries == []
+    # 備份檔應存在
+    assert (tmp_index.with_suffix(".json.bak")).exists()
