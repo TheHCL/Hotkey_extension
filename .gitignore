@@ -14,11 +14,12 @@ htmlcov/
 build/
 dist/
 *.spec
-!PWmgr.spec
-!PWmgrSetup.spec
 
 # Packaging
 packaging/
+
+# install.py 產物——每台機器路徑/帳號都不同,不進版控
+bin/
 
 # IDE
 .idea/
