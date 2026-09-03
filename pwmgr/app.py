@@ -411,18 +411,24 @@ class PwmgrApp:
 
     def _load_entry_to_form(self, entry: PasswordEntry) -> None:
         self._suppress_change = True
-        try:
-            self.label_var.set(entry.label)
-            self.url_entry_var.set(entry.url)
-            self.username_var.set(entry.username)
-            self.password_var.set("")  # 不在記憶體中保留
-            self.notes_text.delete("1.0", tk.END)
-            self.notes_text.insert("1.0", entry.notes)
-            self.notes_text.edit_modified(False)
-        finally:
-            self._suppress_change = False
+        self.label_var.set(entry.label)
+        self.url_entry_var.set(entry.url)
+        self.username_var.set(entry.username)
+        self.password_var.set("")  # 不在記憶體中保留
+        self.notes_text.delete("1.0", tk.END)
+        self.notes_text.insert("1.0", entry.notes)
+        self.notes_text.edit_modified(False)
+        # Text 的 <<Modified>> 是排入事件佇列、非同步觸發的——如果這裡把
+        # _suppress_change 立刻改回 False,上面 delete/insert 排出的事件會在
+        # 下一輪事件迴圈才送達 _on_text_modified,那時旗標已經是 False,
+        # 就會被誤判成使用者手動修改而標成「未儲存」。用 after_idle 延後重設,
+        # 確保排隊中的 <<Modified>> 事件先被吃掉。
+        self.root.after_idle(self._end_suppress_change)
         self._dirty = False
         self._set_status(f"已載入: {entry.label}")
+
+    def _end_suppress_change(self) -> None:
+        self._suppress_change = False
 
     def _on_form_change(self) -> None:
         if getattr(self, "_suppress_change", False):
@@ -446,15 +452,13 @@ class PwmgrApp:
         if self._dirty and not self._confirm_discard_changes():
             return
         self._suppress_change = True
-        try:
-            self.label_var.set("")
-            self.url_entry_var.set(self._suggested_url())
-            self.username_var.set("")
-            self.password_var.set("")
-            self.notes_text.delete("1.0", tk.END)
-            self.notes_text.edit_modified(False)
-        finally:
-            self._suppress_change = False
+        self.label_var.set("")
+        self.url_entry_var.set(self._suggested_url())
+        self.username_var.set("")
+        self.password_var.set("")
+        self.notes_text.delete("1.0", tk.END)
+        self.notes_text.edit_modified(False)
+        self.root.after_idle(self._end_suppress_change)
         self._selected_id = None
         self.tree.selection_remove(self.tree.selection())
         self._dirty = True
