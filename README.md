@@ -25,7 +25,7 @@
 - **本機密碼保管** — 密碼儲存在 Windows Credential Manager(由 DPAPI 加密),不外洩到任何雲端。
 - **Tk GUI** + **系統 tray** + **全域熱鍵 `Ctrl+Shift+L`** 切換視窗。
 - **目前網址高亮** — 擴充功能會把瀏覽器目前 URL 同步給 GUI,符合的條目自動標 ★。
-- **Chrome / Edge 擴充功能** — 偵測目前 tab 的 URL、查詢本機 vault、一鍵自動填入帳密。
+- **Chrome / Edge 擴充功能** — 偵測目前 tab 的 URL、查詢本機 vault、一鍵自動填入帳密;支援 fallback vault browser(未命中時列出全部有 `launch_url` 的條目,點擊自動開新分頁+等 render+填入),可從 popup footer 開關此功能。
 - **20 秒自動清空剪貼簿** — 複製密碼後 20 秒自動清除,降低肩窺風險。
 - **支援多帳號** — 同一網域可存多組帳密(如 `github.com` 個人 + 公司帳)。
 
@@ -159,6 +159,7 @@ python packaging\build.py
 - **新增**:右側表單填好「名稱 / 網域 / 帳號 / 密碼 / 備註」→ 「儲存」
 - **編輯**:左側選條目 → 改欄位 → 「儲存」
 - **複製帳號** / **複製密碼**:左側選條目 → 按按鈕(20 秒後自動清空剪貼簿)
+- **一鍵開啟**:右側「啟動網址」欄位旁邊的「開啟」按鈕可直接以瀏覽器開啟該網址
 - **刪除**:左側選條目 → 「刪除」(會跳確認)
 - **搜尋**:左上方搜尋框即時過濾(對 name / url / username)
 - **快速鍵**:`Ctrl+N` 新增、`Ctrl+S` 儲存、`Delete` 刪除、`Esc` 隱藏到 tray
@@ -169,16 +170,27 @@ python packaging\build.py
 - `https://api.github.com/login` 也會命中(子網域自動涵蓋)
 - `https://www.bbc.co.uk/news` v1 **不命中** `bbc.co.uk`(簡化 eTLD 實作的限制,見 [風險](#風險與限制))
 
+### 啟動網址(`launch_url`)
+
+每筆條目可額外填一個完整網址(例如 `https://github.com/login`),存於 `launch_url` 欄位——純粹給 GUI 與 Chrome 擴充 popup 的「開啟」用,**不會**影響 Chrome 擴充依網域比對(`url` 欄位)的命中邏輯。新增條目時,GUI 會預先把瀏覽器目前回報的完整 URL 帶進這個欄位,直接儲存即可;若留白則該條目在 GUI 和擴充 popup 都不會顯示對應的開啟動作。
+
+- GUI:右側「啟動網址」輸入框旁邊的「開啟」按鈕,呼叫本機預設瀏覽器開啟(Windows 走 `ShellExecute`)。
+- 擴充 popup 行為:當目前網頁沒命中**且 footer 的 navigate toggle 為 ON**,popup 會列「所有有 launch_url 的條目」當作 vault browser;點下去會在新分頁開啟該 URL,等頁面 render 完後自動填入 username/password(30 秒 timeout,放棄時 popup 仍關、新 tab 開著但沒填)。toggle 為 OFF 時,未命中頁面 popup 不列清單,只顯示空狀態。命中頁永遠維持 autofill 行為(不受 toggle 影響)。
+
 ---
 
 ## 瀏覽器擴充功能
 
 擴充功能裝好後:
 
-1. 在 Edge / Chrome 開新分頁到 `https://github.com/login`
-2. 工具列 PWmgr 圖示上會出現 badge `1`(有 1 筆命中)
-3. 點圖示開啟 popup → 看到條目
-4. 點條目 → 自動填入 username / password 欄位
+1. 在 Edge / Chrome 開任一網頁 → 點 PWmgr 圖示
+2. popup 會依「目前網頁是否命中」與「footer 的 navigate toggle」自動採用行為:
+   - **命中(自動填入,不受 toggle 影響)**:列出符合目前網址的條目 → 點條目自動填入 username/password;狀態列「命中 X 筆,點擊自動填入」。
+   - **未命中 + toggle ON(預設)**:列出所有有設定啟動網址的條目 → 點條目在新分頁開啟該 URL,等頁面 render 完(30 秒 timeout)後自動填入;狀態列「未命中,以下為所有可開啟的條目」。
+   - **未命中 + toggle OFF**:顯示「目前網頁沒有符合的條目,請到 PWmgr GUI 新增」,**不列** launch_url。
+3. 工具列右側 PWmgr 圖示上會出現 badge 數字(命中條目數)
+4. footer 的「**啟用未命中頁面的條目快選**」checkbox 控制 fallback 模式是否啟用——toggle 為 OFF 時未命中頁只剩空狀態提示,符合「只要 autofill 不要 vault 快選」的使用情境。設定用 `chrome.storage.sync` 持久化,會跨裝置同步。
+5. 適合「你在 yahoo.com 想直接到 github 設定頁」這類跨站跳轉:popup 一打開就 fallback,打字「github」、點開,新分頁載完就自動填好。
 
 **底層流程**:
 

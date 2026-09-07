@@ -50,10 +50,29 @@ header {
   word-break: break-all;
 }
 
+/* fallback 模式(fallback 渲染前顯示):搜尋 vault 條目 */
+#launch-search {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 8px 12px;
+  padding: 6px 10px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font: inherit;
+  box-sizing: border-box;
+}
+
+#launch-search:focus {
+  outline: none;
+  border-color: #0078d4;
+}
+
 #matches {
   list-style: none;
   margin: 0;
   padding: 0;
+  max-height: 360px; /* fallback 模式約 8 個條目高度;命中模式不會觸發 */
+  overflow-y: auto;
 }
 
 #matches li {
@@ -85,6 +104,15 @@ header {
   gap: 8px;
 }
 
+.matches-overflow {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #888;
+  background: #f9f9f9;
+  text-align: center;
+  border-top: 1px solid #eee;
+}
+
 .empty {
   margin: 16px 12px;
   color: #888;
@@ -105,4 +133,25 @@ footer {
   color: #888;
   border-top: 1px solid #eee;
   min-height: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#status {
+  margin-left: auto;
+}
+
+.settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #444;
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
 }

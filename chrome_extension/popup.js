@@ -1,17 +1,19 @@
-// popup.js — 顯示目前 tab 命中條目,點擊觸發自動填入
+// popup.js — 單一視窗,自動分支:命中時 autofill,未命中時 fallback 列出 launch_url 條目
 
 const $conn = document.getElementById("conn");
 const $currentUrl = document.getElementById("current-url");
 const $matches = document.getElementById("matches");
 const $empty = document.getElementById("empty");
-const $noHost = document.getElementById("no-host");
 const $status = document.getElementById("status");
+const $launchSearch = document.getElementById("launch-search");
+const $navigateToggle = document.getElementById("navigate-toggle");
 
 let currentTabId = null;
 let currentUrl = null;
+let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
 
 async function init() {
-  // 1. 確認原生主機連線
+  // 1. 連線檢查
   const pingResp = await chrome.runtime.sendMessage({ type: "ping" });
   if (pingResp && pingResp.ok) {
     $conn.textContent = "已連線";
@@ -19,34 +21,74 @@ async function init() {
   } else {
     $conn.textContent = "未連線";
     $conn.classList.add("bad");
-    $noHost.hidden = false;
+    showEmpty("找不到原生主機。請確認 python install.py 已執行且擴充 ID 已註冊。");
     return;
   }
 
-  // 2. 拿目前 tab 與 URL
+  // 2. 目前 tab + URL
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) {
-    $status.textContent = "找不到目前分頁";
+    showEmpty("找不到目前分頁");
     return;
   }
   currentTabId = tab.id;
   currentUrl = tab.url || "";
-
   $currentUrl.textContent = currentUrl || "(沒有 URL)";
 
-  // 3. 拿命中條目——即時查詢,不用快取(避免 PWmgr GUI 剛新增/修改的條目沒反映出來)
-  const resp = await chrome.runtime.sendMessage({ type: "queryFresh", url: currentUrl, tabId: currentTabId });
-  const matches = (resp && resp.ok && resp.matches) || [];
-  if (matches.length === 0) {
-    $empty.hidden = false;
+  // 3. 讀 navigate toggle(預設 ON)
+  const { navigate_enabled = true } = await chrome.storage.sync.get({
+    navigate_enabled: true,
+  });
+  $navigateToggle.checked = navigate_enabled;
+  $navigateToggle.addEventListener("change", () => {
+    chrome.storage.sync.set({ navigate_enabled: $navigateToggle.checked });
+  });
+
+  // 4. 嘗試取得命中條目
+  const qResp = await chrome.runtime.sendMessage({
+    type: "queryFresh",
+    url: currentUrl,
+    tabId: currentTabId,
+  });
+  const matches = (qResp && qResp.ok && qResp.matches) || [];
+  if (matches.length > 0) {
+    setStatus(`命中 ${matches.length} 筆,點擊自動填入`);
+    renderAutofillList(matches);
     return;
   }
-  renderMatches(matches);
+
+  // 5. 未命中 → toggle OFF 時不列 fallback,只顯示空狀態
+  if (!navigate_enabled) {
+    showEmpty("目前網頁沒有符合的條目。請到 PWmgr GUI 新增條目後再開啟此頁。");
+    return;
+  }
+
+  // 6. 無命中 + toggle ON → fallback:列全部有 launch_url 的條目
+  setStatus("未命中,以下為所有可開啟的條目");
+  $launchSearch.hidden = false;
+  const lResp = await chrome.runtime.sendMessage({ type: "getAllEntries" });
+  if (!lResp || !lResp.ok) {
+    showEmpty(
+      `無法取得條目:${(lResp && (lResp.code || lResp.error)) || "unknown"}`
+    );
+    return;
+  }
+  allLaunches = (lResp.entries || []).filter((e) => e.launch_url);
+  if (allLaunches.length === 0) {
+    showEmpty(
+      "目前網頁沒有符合的條目,且資料庫裡沒有任何啟動網址。請到 PWmgr GUI 新增條目時填寫「啟動網址」欄位。"
+    );
+    return;
+  }
+  $launchSearch.value = "";
+  $launchSearch.addEventListener("input", renderLaunchList);
+  renderLaunchList();
 }
 
-function renderMatches(matches) {
-  $matches.hidden = false;
+function renderAutofillList(matches) {
   $matches.innerHTML = "";
+  $matches.hidden = false;
+  $empty.hidden = true;
   for (const m of matches) {
     const li = document.createElement("li");
     li.dataset.id = m.id;
@@ -71,20 +113,118 @@ function renderMatches(matches) {
   }
 }
 
+function renderLaunchList() {
+  const keyword = $launchSearch.value.trim().toLowerCase();
+  let shown = allLaunches;
+  if (keyword) {
+    shown = allLaunches.filter(
+      (e) =>
+        (e.label || "").toLowerCase().includes(keyword) ||
+        (e.launch_url || "").toLowerCase().includes(keyword) ||
+        (e.url || "").toLowerCase().includes(keyword)
+    );
+    if (shown.length === 0) {
+      $matches.innerHTML = "";
+      $matches.hidden = true;
+      showEmpty(`沒有符合「${$launchSearch.value}」的條目`);
+      return;
+    }
+  }
+
+  $matches.innerHTML = "";
+  $matches.hidden = false;
+  $empty.hidden = true;
+
+  const MAX_VISIBLE = 8;
+  const sl = shown.slice(0, MAX_VISIBLE);
+  for (const e of sl) {
+    const li = document.createElement("li");
+    li.dataset.id = e.id;
+
+    const label = document.createElement("div");
+    label.className = "entry-label";
+    label.textContent = e.label;
+
+    const meta = document.createElement("div");
+    meta.className = "entry-meta";
+    const d = document.createElement("span");
+    d.textContent = e.launch_url;
+    meta.appendChild(d);
+
+    li.appendChild(label);
+    li.appendChild(meta);
+    li.addEventListener("click", () => launchAndFill(e.launch_url, e.id));
+    $matches.appendChild(li);
+  }
+
+  if (shown.length > MAX_VISIBLE) {
+    const note = document.createElement("li");
+    note.className = "matches-overflow";
+    note.textContent = `共 ${shown.length} 筆,僅顯示前 ${MAX_VISIBLE} 筆(請縮小搜尋範圍)`;
+    note.style.cursor = "default";
+    $matches.appendChild(note);
+  }
+}
+
 async function fill(id, li) {
-  $status.textContent = "填入中…";
+  setStatus("填入中…");
   li.style.opacity = "0.5";
-  const resp = await chrome.runtime.sendMessage({ type: "fetch", id, tabId: currentTabId });
+  const resp = await chrome.runtime.sendMessage({
+    type: "fetch",
+    id,
+    tabId: currentTabId,
+  });
   li.style.opacity = "1";
   if (resp && resp.ok) {
-    $status.textContent = "已填入;20 秒後自動清空剪貼簿(GUI 端)";
-    // 1.5 秒後關 popup
+    setStatus("已填入;20 秒後自動清空剪貼簿(GUI 端)");
     setTimeout(() => window.close(), 1500);
   } else if (resp && resp.code === "BUSY") {
-    $status.textContent = "密碼管理員忙碌中,稍後再試";
+    setStatus("密碼管理員忙碌中,稍後再試");
   } else {
-    $status.textContent = `失敗: ${(resp && (resp.code || resp.error)) || "unknown"}`;
+    setStatus(`失敗: ${(resp && (resp.code || resp.error)) || "unknown"}`);
   }
+}
+
+async function openLaunch(url) {
+  setStatus("開啟中…");
+  const resp = await chrome.runtime.sendMessage({ type: "openLaunch", url });
+  if (resp && resp.ok) {
+    setStatus("已在新分頁開啟");
+    setTimeout(() => window.close(), 800);
+  } else {
+    setStatus(`開啟失敗: ${(resp && (resp.code || resp.error)) || "unknown"}`);
+  }
+}
+
+async function launchAndFill(url, id) {
+  setStatus("開啟中…");
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "launchAndFill", url, id });
+  } catch (e) {
+    console.warn("[pwmgr] launchAndFill sendMessage threw", e);
+    setStatus(`開啟失敗: sendMessage 例外 ${e && e.message || e}`);
+    return;
+  }
+  console.log("[pwmgr] launchAndFill resp", resp);
+  if (resp && resp.ok) {
+    setStatus("已在新分頁開啟,等待頁面 render 後自動填入");
+    setTimeout(() => window.close(), 800);
+  } else {
+    setStatus(`開啟失敗: ${(resp && (resp.code || resp.error)) || "unknown"}`);
+  }
+}
+
+function showEmpty(text) {
+  $matches.innerHTML = "";
+  $matches.hidden = true;
+  $launchSearch.hidden = true;
+  $empty.textContent = text;
+  $empty.hidden = false;
+}
+
+function setStatus(text) {
+  $status.textContent = text;
 }
 
 init();

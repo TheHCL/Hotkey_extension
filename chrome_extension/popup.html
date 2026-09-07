@@ -12,13 +12,15 @@
   </header>
   <div id="content">
     <p class="hint" id="current-url"></p>
+    <input id="launch-search" type="search" placeholder="搜尋…" hidden />
     <ul id="matches" hidden></ul>
-    <p class="empty" id="empty" hidden>目前網頁沒有符合的條目。</p>
-    <p class="empty" id="no-host" hidden>
-      找不到原生主機。請確認 <code>python install.py</code> 已執行且擴充 ID 已註冊。
-    </p>
+    <p class="empty" id="empty" hidden></p>
   </div>
   <footer>
+    <label class="settings">
+      <input type="checkbox" id="navigate-toggle" />
+      <span>啟用未命中頁面的條目快選</span>
+    </label>
     <span id="status"></span>
   </footer>
   <script src="popup.js"></script>

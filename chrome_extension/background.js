@@ -6,10 +6,12 @@
 
 const HOST_NAME = "com.thehcl.pwmgr";
 const BADGE_COLOR = "#0078d4";
+const PENDING_FILL_TTL_MS = 30000;
 
 let nativePort = null;
 let lastTabUrl = null;   // 上次主動查詢的 URL(避免重複 query)
 let currentMatches = {}; // tabId -> [{id, label, username, url}]
+let pendingFill = {};    // tabId -> { username, password, url, timer }
 
 // --- 原生主機連線管理 -------------------------------------------------------
 
@@ -33,6 +35,24 @@ function connectNative() {
     // 5 秒後重連
     setTimeout(connectNative, 5000);
   });
+}
+
+// --- launchAndFill 暫存管理 -----------------------------------------------
+
+function setPendingFill(tabId, creds) {
+  clearPendingFill(tabId);
+  const timer = setTimeout(function () {
+    console.warn("[pwmgr] 等待 tab " + tabId + " render 超過 " + (PENDING_FILL_TTL_MS / 1000) + " 秒,放棄填入");
+    clearPendingFill(tabId);
+  }, PENDING_FILL_TTL_MS);
+  pendingFill[tabId] = { username: creds.username, password: creds.password, url: creds.url, timer: timer };
+}
+
+function clearPendingFill(tabId) {
+  const p = pendingFill[tabId];
+  if (!p) return;
+  clearTimeout(p.timer);
+  delete pendingFill[tabId];
 }
 
 function sendNative(msg) {
@@ -126,6 +146,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // 部分瀏覽器 onUpdated 不給 url,但 url 變了——主動讀
     onTabUrlChange(tabId, tab.url);
   }
+
+  // launchAndFill:新分頁 render 完 → 送 fill 訊息
+  if (changeInfo.status === "complete" && pendingFill[tabId]) {
+    const creds = pendingFill[tabId];
+    clearPendingFill(tabId);
+    chrome.tabs.sendMessage(tabId, { type: "fill", username: creds.username, password: creds.password }).catch(function () {
+      // content script 可能未注入(non-http 跳轉)
+    });
+  }
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -139,6 +168,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete currentMatches[tabId];
+  clearPendingFill(tabId);
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -194,6 +224,78 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       const resp = await sendNative({ type: "ping" });
       sendResponse(resp);
+    })();
+    return true;
+  }
+
+  if (msg.type === "getAllEntries") {
+    (async () => {
+      const resp = await sendNative({ type: "list" });
+      sendResponse(resp);
+    })();
+    return true;
+  }
+
+  if (msg.type === "openLaunch") {
+    (async () => {
+      const url = String(msg.url || "");
+      if (!/^https?:\/\//i.test(url)) {
+        sendResponse({ ok: false, code: "BAD_URL", error: "僅支援 http(s)" });
+        return;
+      }
+      try {
+        await chrome.tabs.create({ url });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, code: "TAB_CREATE_FAIL", error: String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "launchAndFill") {
+    // fallback 模式 click → 開新分頁 + 等 render + 自動填入
+    (async () => {
+      const url = String(msg.url || "");
+      const id = String(msg.id || "");
+      console.log("[pwmgr] launchAndFill start", url, id);
+      if (!/^https?:\/\//i.test(url)) {
+        sendResponse({ ok: false, code: "BAD_URL", error: "僅支援 http(s)" });
+        return;
+      }
+      if (!id) {
+        sendResponse({ ok: false, code: "BAD_REQUEST", error: "缺少 id" });
+        return;
+      }
+
+      // 1. 先 fetch credentials,避免 status=complete 時還在等原生主機
+      const fResp = await sendNative({ type: "fetch", id });
+      console.log("[pwmgr] launchAndFill fetch resp", fResp);
+      if (!fResp || !fResp.ok) {
+        sendResponse(fResp || { ok: false, code: "FETCH_FAIL" });
+        return;
+      }
+
+      // 2. 建立新分頁
+      let newTab;
+      try {
+        newTab = await chrome.tabs.create({ url });
+        console.log("[pwmgr] launchAndFill tab created", newTab && newTab.id);
+      } catch (e) {
+        console.warn("[pwmgr] launchAndFill TAB_CREATE_FAIL", e);
+        sendResponse({ ok: false, code: "TAB_CREATE_FAIL", error: String(e) });
+        return;
+      }
+
+      // 3. 暫存 credentials,等 onUpdated status=complete 觸發 fill
+      setPendingFill(newTab.id, {
+        username: fResp.entry.username,
+        password: fResp.password,
+        url: url,
+      });
+
+      console.log("[pwmgr] launchAndFill sending ok resp, tabId=", newTab.id);
+      sendResponse({ ok: true, tabId: newTab.id });
     })();
     return true;
   }
