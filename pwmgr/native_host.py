@@ -18,7 +18,7 @@ import threading
 from typing import Any
 
 from . import storage
-from .config import MAX_PASSWORD_BYTES
+from .config import MAX_GROUP_CHARS, MAX_PASSWORD_BYTES
 from .models import PasswordEntry
 
 # --- 例外 --------------------------------------------------------------------
@@ -39,6 +39,16 @@ class NativeHostError(Exception):
 
 
 # --- I/O ---------------------------------------------------------------------
+
+
+def _normalize_group(value: Any) -> str:
+    """正規化 group 欄位:strip 空白、長度上限、空字串保留(代表「未分類」)。"""
+    if not isinstance(value, str):
+        raise BadRequestError("group 必須是字串")
+    value = value.strip()
+    if len(value) > MAX_GROUP_CHARS:
+        raise BadRequestError(f"group 超過 {MAX_GROUP_CHARS} 字")
+    return value
 
 
 def _read_exact(stream, n: int) -> bytes:
@@ -98,6 +108,7 @@ def _handle_query(req: dict[str, Any]) -> dict[str, Any]:
                 "username": e.username,
                 "url": e.url,
                 "launch_url": e.launch_url,
+                "group": e.group,
             }
             for e in matches
         ],
@@ -143,14 +154,17 @@ def _handle_save(req: dict[str, Any]) -> dict[str, Any]:
         for k in ("label", "url", "username", "notes", "launch_url"):
             if k in entry_data:
                 setattr(entry, k, entry_data[k])
+        if "group" in entry_data:
+            entry.group = _normalize_group(entry_data["group"])
     else:
-        # 新建——從 entry_data 拿 label/url/username/notes/launch_url,id 由 PasswordEntry.new 產生
+        # 新建——從 entry_data 拿 label/url/username/notes/launch_url/group,id 由 PasswordEntry.new 產生
         entry = PasswordEntry.new(
             label=str(entry_data.get("label", "")),
             url=str(entry_data.get("url", "")),
             username=str(entry_data.get("username", "")),
             notes=str(entry_data.get("notes", "")),
             launch_url=str(entry_data.get("launch_url", "")),
+            group=_normalize_group(entry_data.get("group", "")),
         )
     new_id = storage.save_entry(entry, password)
     return {"ok": True, "id": new_id}

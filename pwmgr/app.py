@@ -66,8 +66,8 @@ class PwmgrApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("980x620")
-        self.root.minsize(860, 520)
+        self.root.geometry("1100x780")
+        self.root.minsize(960, 640)
         self.root.configure(background=PALETTE["bg"])
         self._set_window_icon()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -257,21 +257,38 @@ class PwmgrApp:
         self.tree = ttk.Treeview(
             list_inner,
             columns=("label", "username"),
-            show="headings",
+            show="tree headings",  # 顯示樹狀展開指示器 + 兩欄 heading
             selectmode="browse",
         )
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=24, minwidth=24, stretch=False, anchor=tk.W)
         self.tree.heading("label", text="名稱 / 網域")
         self.tree.heading("username", text="帳號")
-        self.tree.column("label", width=260, anchor=tk.W)
+        self.tree.column("label", width=240, anchor=tk.W)
         self.tree.column("username", width=150, anchor=tk.W)
         self.tree.tag_configure("match", foreground=PALETTE["accent"], font=FONT_BOLD)
         self.tree.tag_configure("odd", background=PALETTE["row_alt"])
         self.tree.tag_configure("even", background="white")
+        # 群組 parent row 用,粗體 + 淡背景
+        self.tree.tag_configure(
+            "group-header",
+            font=FONT_BOLD,
+            background=PALETTE["row_alt"],
+            foreground=PALETTE["muted"],
+        )
         sb = ttk.Scrollbar(list_inner, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
         sb.pack(side=tk.LEFT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        # 拖拉重排:用 mouse event 模擬 DnD(Tk Treeview 沒原生 DnD)
+        self._drag_iid: str | None = None  # 拖拉中正在拖的條目 iid
+        self._drag_threshold = 6  # 超過 N 像素才算拖(避免按一下就被當 drag 開頭)
+        self._drag_started = False  # 是否真的進入 drag 模式(超過 threshold 才算)
+        self._drag_press_y = 0
+        self.tree.bind("<ButtonPress-1>", self._on_btn_press, add="+")
+        self.tree.bind("<B1-Motion>", self._on_btn_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_btn_release, add="+")
         middle.add(left, weight=3)
 
         # 右 form(卡片)
@@ -302,15 +319,19 @@ class PwmgrApp:
         self.label_var = tk.StringVar()
         self.url_entry_var = tk.StringVar()
         self.username_var = tk.StringVar()
+        self.group_var = tk.StringVar()
         self.launch_url_var = tk.StringVar()
         self.notes_text: tk.Text
         self.password_var = tk.StringVar()
         self.show_password_var = tk.BooleanVar(value=False)
+        # 同一個 form 週期內已彈過的驗證警告 key;成功儲存 / 新增 / 載入時清空
+        self._shown_warnings: set[str] = set()
 
         rows = [
             ("名稱", "label"),
             ("網域", "url_entry"),
             ("帳號", "username"),
+            ("群組", "group"),
         ]
         for i, (label, key) in enumerate(rows, start=1):
             ttk.Label(parent, text=label, style="CardMuted.TLabel").grid(
@@ -398,20 +419,186 @@ class PwmgrApp:
 
     def _refresh_listbox(self) -> None:
         q = self.search_var.get().strip().lower()
-        self.tree.delete(*self.tree.get_children())
-        row = 0
-        for e in sorted(self._entries, key=lambda x: x.updated_at, reverse=True):
-            if q and q not in e.label.lower() and q not in e.url.lower() and q not in e.username.lower():
-                continue
-            is_match = bool(self._current_url and matches(e.url, self._current_url, ""))
-            label = (MATCH_PREFIX if is_match else "") + f"{e.label}  ({e.url})"
-            tag = "match" if is_match else ("odd" if row % 2 else "even")
-            self.tree.insert("", tk.END, iid=e.id, values=(label, e.username), tags=(tag,))
-            row += 1
+        # snapshot 展開狀態——URL poll 觸發 refresh 時保留使用者的開合
+        open_states: dict[str, bool] = {
+            iid: bool(self.tree.item(iid, "open"))
+            for iid in self.tree.get_children("")
+            if iid.startswith("group::g::")
+        }
+        self.tree.delete(*self.tree.get_children(""))
+        self._drag_disabled = bool(q)  # 搜尋模式禁用拖拉
+
+        if q:
+            # 搜尋模式:扁平列舉所有符合的條目(隱藏群組結構)
+            row = 0
+            for e in self._entries:
+                if q not in e.label.lower() and q not in e.url.lower() \
+                        and q not in e.username.lower() and q not in e.group.lower():
+                    continue
+                self._insert_entry_row(e, parent="", row=row)
+                row += 1
+            return
+
+        # 一般模式:依群組分層,群組順序採 self._entries 中第一次出現的順序
+        NO_GROUP = "__none__"
+        seen_groups: dict[str, str] = {}
+        counts: dict[str, int] = {}
+        for e in self._entries:
+            key = (e.group or "").strip() or NO_GROUP
+            if key not in seen_groups:
+                seen_groups[key] = f"group::g::{key}"
+                counts[key] = 0
+            counts[key] += 1
+        for key, parent_iid in seen_groups.items():
+            display = "未分類" if key == NO_GROUP else key
+            was_open = open_states.get(parent_iid, True)
+            self.tree.insert(
+                "", tk.END, iid=parent_iid,
+                text="",
+                values=(f"{display}  ({counts[key]})", ""),
+                tags=("group-header", "even"),
+                open=was_open,
+            )
+        for e in self._entries:
+            key = (e.group or "").strip() or NO_GROUP
+            self._insert_entry_row(e, parent=seen_groups[key], row=0)
+
+    def _insert_entry_row(self, e: PasswordEntry, *, parent: str, row: int) -> None:
+        """插入單筆條目 row,parent 為空字串表示 root(搜尋模式)。"""
+        is_match = bool(self._current_url and matches(e.url, self._current_url, ""))
+        label = (MATCH_PREFIX if is_match else "") + f"{e.label}  ({e.url})"
+        tag = "match" if is_match else ("odd" if row % 2 else "even")
+        self.tree.insert(parent, tk.END, iid=e.id, values=(label, e.username), tags=(tag,))
+
+    @staticmethod
+    def _is_group_iid(iid: str) -> bool:
+        return iid.startswith("group::g::")
+
+    @staticmethod
+    def _group_name_from_iid(iid: str) -> str:
+        return iid[len("group::g::"):] if iid.startswith("group::g::") else ""
+
+    def _flatten_visible_order(self) -> list[str]:
+        """回傳目前顯示中所有 entry iid 的扁平順序(對應 storage array)。
+
+        一般模式:走 root 的群組 parent,逐個 group 收 entries。
+        搜尋模式:parent=="" 直接列(沒群組 parent)。
+        防呆:任何殘留的 group:: iid 跳過。
+        """
+        out: list[str] = []
+        for parent_iid in self.tree.get_children(""):
+            if self._is_group_iid(parent_iid):
+                out.extend(self.tree.get_children(parent_iid))
+            else:
+                out.append(parent_iid)
+        return [iid for iid in out if not self._is_group_iid(iid)]
+
+    def _on_btn_press(self, event) -> None:
+        """Treeview 按下滑鼠:記住起點 iid,尚未進入 drag 模式(等 motion 過 threshold)。"""
+        if getattr(self, "_drag_disabled", False):
+            # 搜尋模式禁用拖拉(避免 hidden parent 內條目被誤拖破壞群組結構)
+            self._drag_iid = None
+            self._drag_started = False
+            return
+        iid = self.tree.identify_row(event.y)
+        self._drag_iid = iid if iid else None
+        self._drag_source_is_group = bool(self._drag_iid and self._is_group_iid(self._drag_iid))
+        self._drag_started = False
+        self._drag_press_y = event.y
+
+    def _on_btn_motion(self, event) -> None:
+        """拖動中:超過 threshold 後進入 drag,依滑鼠位置移動 row(支援群組 header)。"""
+        if not self._drag_iid:
+            return
+        if getattr(self, "_drag_disabled", False):
+            return
+        if not self._drag_started:
+            if abs(event.y - self._drag_press_y) < self._drag_threshold:
+                return
+            self._drag_started = True
+
+        target = self.tree.identify_row(event.y)
+        if not target or target == self._drag_iid:
+            return
+
+        try:
+            if self._drag_source_is_group:
+                self._move_group(target)
+            else:
+                self._move_entry(target)
+        except tk.TclError:
+            return
+
+    def _move_group(self, target: str) -> None:
+        """拖群組 header:整組 subtree 跟著搬。"""
+        # 把 target 標準化為 header iid(若指到 entry,改成其 parent)
+        if self._is_group_iid(target):
+            target_header = target
+        else:
+            target_header = self.tree.parent(target)
+        if not target_header or not self._is_group_iid(target_header):
+            return
+        if target_header == self._drag_iid:
+            return
+        # 拖到自己底下任何 entry → no-op(避免自我 sub-tree shift)
+        if target_header != target and self.tree.parent(target) == self._drag_iid:
+            return
+        target_idx = self.tree.index(target_header)
+        # header 自己若在 target 之前,要 -1(因為 source 先 detach)
+        src_idx = self.tree.index(self._drag_iid)
+        if src_idx < target_idx:
+            target_idx -= 1
+        self.tree.move(self._drag_iid, "", target_idx)
+        self._set_status("拖移中…放開滑鼠儲存新順序")
+
+    def _move_entry(self, target: str) -> None:
+        """拖 entry:只能在同 parent 內移動,跨群組拒絕。"""
+        source_parent = self.tree.parent(self._drag_iid)
+        if not source_parent:
+            # 搜尋模式(扁平)——理論上 drag_disabled 已擋,但保險起見
+            return
+        if self._is_group_iid(target):
+            # 拖到別群組 header 上 → 拒絕
+            self._set_status("不可跨群組移動")
+            return
+        target_parent = self.tree.parent(target)
+        if target_parent != source_parent:
+            self._set_status("不可跨群組移動")
+            return
+        if target == self._drag_iid:
+            return
+        target_idx = self.tree.index(target)
+        src_idx = self.tree.index(self._drag_iid)
+        if src_idx < target_idx:
+            target_idx -= 1
+        self.tree.move(self._drag_iid, source_parent, target_idx)
+        self._set_status("拖移中…放開滑鼠儲存新順序")
+
+    def _on_btn_release(self, _event) -> None:
+        """放開滑鼠:若有實際拖動,把目前顯示順序存回 storage。"""
+        if not self._drag_iid:
+            return
+        if self._drag_started and not getattr(self, "_drag_disabled", False):
+            new_order = self._flatten_visible_order()
+            try:
+                storage.set_entry_order(new_order)
+                self._refresh_entries()
+                self._set_status("已儲存新順序")
+            except Exception as e:
+                self._set_status(f"儲存順序失敗:{e}")
+                self._refresh_entries()
+        self._drag_iid = None
+        self._drag_source_is_group = False
+        self._drag_started = False
+        self._drag_press_y = 0
 
     def _on_select(self, _event=None) -> None:
         sel = self.tree.selection()
         if not sel:
+            return
+        # 群組 header 是 parent row,不是條目——不應載入表單
+        if self._is_group_iid(sel[0]):
+            self.tree.selection_remove(sel)
             return
         if self._dirty and not self._confirm_discard_changes():
             # 還原選擇
@@ -429,6 +616,7 @@ class PwmgrApp:
         self.label_var.set(entry.label)
         self.url_entry_var.set(entry.url)
         self.username_var.set(entry.username)
+        self.group_var.set(entry.group or "")
         self.launch_url_var.set(entry.launch_url)
         self.password_var.set("")  # 不在記憶體中保留
         self.notes_text.delete("1.0", tk.END)
@@ -441,6 +629,7 @@ class PwmgrApp:
         # 確保排隊中的 <<Modified>> 事件先被吃掉。
         self.root.after_idle(self._end_suppress_change)
         self._dirty = False
+        self._shown_warnings = set()
         self._set_status(f"已載入: {entry.label}")
 
     def _end_suppress_change(self) -> None:
@@ -471,6 +660,7 @@ class PwmgrApp:
         self.label_var.set("")
         self.url_entry_var.set(self._suggested_url())
         self.username_var.set("")
+        self.group_var.set("")
         self.launch_url_var.set(self._current_url or "")
         self.password_var.set("")
         self.notes_text.delete("1.0", tk.END)
@@ -479,6 +669,7 @@ class PwmgrApp:
         self._selected_id = None
         self.tree.selection_remove(self.tree.selection())
         self._dirty = True
+        self._shown_warnings = set()
         self._set_status("新增條目(尚未儲存)")
 
     def _suggested_url(self) -> str:
@@ -495,12 +686,27 @@ class PwmgrApp:
         label = self.label_var.get().strip()
         url = self.url_entry_var.get().strip()
         username = self.username_var.get().strip()
+        group = self.group_var.get().strip()
         launch_url = self.launch_url_var.get().strip()
         password = self.password_var.get()
         notes = self.notes_text.get("1.0", tk.END).rstrip("\n")
 
         if not label or not url or not username:
-            messagebox.showwarning("欄位不完整", "「名稱」、「網域」、「帳號」皆不可空白。")
+            if "incomplete" not in self._shown_warnings:
+                messagebox.showwarning("欄位不完整", "「名稱」、「網域」、「帳號」皆不可空白。")
+                self._shown_warnings.add("incomplete")
+            self._dirty = False
+            self._set_status("欄位不完整,請補齊後再儲存")
+            return
+        if len(group) > 64:
+            key = f"group:{len(group)}"
+            if key not in self._shown_warnings:
+                messagebox.showwarning("群組過長", f"「群組」最多 64 字,目前 {len(group)}。")
+                self._shown_warnings.add(key)
+            # 驗證失敗後清掉 dirty:使用者已從警告知道問題,不再被「未儲存」追問;
+            # 之後只要繼續編輯,trace_add 會自動把 _dirty 設回 True。
+            self._dirty = False
+            self._set_status(f"群組過長:{len(group)}/64 字,請縮短後再儲存")
             return
         if launch_url:
             try:
@@ -521,7 +727,7 @@ class PwmgrApp:
             if self._selected_id:
                 entry = next((e for e in self._entries if e.id == self._selected_id), None)
                 if entry is None:
-                    entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url)
+                    entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url, group=group)
                     storage.save_entry(entry, password)
                 else:
                     entry.label = label
@@ -529,6 +735,7 @@ class PwmgrApp:
                     entry.username = username
                     entry.notes = notes
                     entry.launch_url = launch_url
+                    entry.group = group
                     if password:
                         storage.save_entry(entry, password)
                     else:
@@ -537,7 +744,7 @@ class PwmgrApp:
                         # 否則會把 keyring 裡原本的密碼覆蓋成空字串。
                         storage.update_entry(entry)
             else:
-                entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url)
+                entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url, group=group)
                 storage.save_entry(entry, password)
         except storage.PasswordTooLongError as e:
             messagebox.showerror("密碼過長", str(e))
@@ -552,6 +759,7 @@ class PwmgrApp:
         # 編輯後清空密碼欄,避免殘留明文
         self.password_var.set("")
         self._dirty = False
+        self._shown_warnings = set()
         self._refresh_entries()
         self.tree.selection_set(entry.id)
         self._selected_id = entry.id

@@ -55,6 +55,9 @@ MAX_PASSWORD_BYTES = 2500
 # 預設 notes 上限
 MAX_NOTES_CHARS = 500
 
+# group(群組)字數上限——自由字串,給 popup dropdown 與 Tk 表單共用
+MAX_GROUP_CHARS = 64
+
 # 複製密碼後自動清空剪貼簿的秒數
 CLIPBOARD_CLEAR_SECONDS = 20
 

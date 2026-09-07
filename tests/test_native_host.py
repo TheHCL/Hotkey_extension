@@ -297,3 +297,154 @@ def test_native_query_includes_launch_url(isolated, fake_keyring) -> None:
     assert r["ok"] is True
     assert len(r["matches"]) == 1
     assert r["matches"][0]["launch_url"] == "https://github.com/login"
+
+
+# --- group 欄位 -------------------------------------------------------------
+
+
+def test_native_save_includes_group(isolated, fake_keyring) -> None:
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {
+            "label": "GH",
+            "url": "github.com",
+            "username": "alice",
+            "group": "工作",
+        },
+        "password": "p",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(msgs)))["id"]
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["ok"] is True
+    assert r["entry"]["group"] == "工作"
+
+
+def test_native_save_strips_whitespace_from_group(isolated, fake_keyring) -> None:
+    """native host 端要 strip 掉 group 頭尾空白(與其他欄位一致)。"""
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {
+            "label": "GH",
+            "url": "github.com",
+            "username": "alice",
+            "group": "  工作  ",
+        },
+        "password": "p",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(msgs)))["id"]
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["entry"]["group"] == "工作"
+
+
+def test_native_save_rejects_oversized_group(isolated, fake_keyring) -> None:
+    """group 超過 MAX_GROUP_CHARS (64) 要回 BAD_REQUEST。"""
+    from pwmgr.config import MAX_GROUP_CHARS
+
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {
+            "label": "GH",
+            "url": "github.com",
+            "username": "alice",
+            "group": "x" * (MAX_GROUP_CHARS + 1),
+        },
+        "password": "p",
+    })
+    r = _read_message(io.BytesIO(_drive_loop(msgs)))
+    assert r["code"] == "BAD_REQUEST"
+
+
+def test_native_save_without_group_defaults_empty(isolated, fake_keyring) -> None:
+    """舊用戶端沒帶 group 時,要容錯(預設空字串)。"""
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {"label": "Other", "url": "x.com", "username": "u"},
+        "password": "p",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(msgs)))["id"]
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["entry"]["group"] == ""
+
+
+def test_native_list_includes_group(isolated, fake_keyring) -> None:
+    """list 訊息要回傳每筆 entry 的 group。"""
+    msgs = b"".join([
+        _encode_message({
+            "type": "save",
+            "entry": {
+                "label": "A",
+                "url": "a.com",
+                "username": "u",
+                "group": "工作",
+            },
+            "password": "p",
+        }),
+        _encode_message({
+            "type": "save",
+            "entry": {
+                "label": "B",
+                "url": "b.com",
+                "username": "u",
+                "group": "個人",
+            },
+            "password": "p",
+        }),
+        _encode_message({"type": "list"}),
+    ])
+    out = _drive_loop(msgs)
+    s = io.BytesIO(out)
+    _read_message(s)
+    _read_message(s)
+    r = _read_message(s)
+    groups = {e["group"] for e in r["entries"]}
+    assert groups == {"工作", "個人"}
+
+
+def test_native_query_includes_group(isolated, fake_keyring) -> None:
+    """query 的 match 結果也要帶 group(與 _handle_query 手寫 dict 一致)。"""
+    msgs = b"".join([
+        _encode_message({
+            "type": "save",
+            "entry": {
+                "label": "GH",
+                "url": "github.com",
+                "username": "alice",
+                "group": "工作",
+            },
+            "password": "p",
+        }),
+        _encode_message({"type": "query", "url": "https://github.com/"}),
+    ])
+    out = _drive_loop(msgs)
+    s = io.BytesIO(out)
+    _read_message(s)
+    r = _read_message(s)
+    assert r["ok"] is True
+    assert r["matches"][0]["group"] == "工作"
+
+
+def test_native_update_existing_with_group(isolated, fake_keyring) -> None:
+    """編輯既有條目(帶 id)時要能更新 group。"""
+    create = _encode_message({
+        "type": "save",
+        "entry": {"label": "GH", "url": "github.com", "username": "alice"},
+        "password": "p",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(create)))["id"]
+
+    update = _encode_message({
+        "type": "save",
+        "entry": {"id": eid, "label": "GH", "url": "github.com", "username": "alice", "group": "個人"},
+        "password": "p",
+    })
+    _drive_loop(update)
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["entry"]["group"] == "個人"

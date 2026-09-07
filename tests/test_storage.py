@@ -248,3 +248,99 @@ def test_update_entry_preserves_launch_url(fake_keyring, tmp_index, null_locks) 
 
     reloaded = storage.load_index()[0]
     assert reloaded.launch_url == "https://github.com/settings/tokens"
+
+
+# --- group 欄位 -------------------------------------------------------------
+
+
+def test_save_entry_roundtrips_group(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new("Dell", "dell.com", "alice", group="工作")
+    storage.save_entry(e, "secret")
+
+    loaded = storage.load_index()
+    assert len(loaded) == 1
+    assert loaded[0].group == "工作"
+    assert loaded[0].to_dict()["group"] == "工作"
+
+    # 舊資料沒有 group 鍵時,from_dict 要能容錯讀成空字串
+    raw = json.loads(tmp_index.read_text(encoding="utf-8"))["entries"][0]
+    raw.pop("group", None)
+    assert PasswordEntry.from_dict(raw).group == ""
+
+
+def test_update_entry_preserves_group(fake_keyring, tmp_index, null_locks) -> None:
+    """update_entry(編輯既有條目、密碼留空的路徑)要能把 group 一起寫進去。"""
+    e = PasswordEntry.new("GH", "github.com", "alice", group="工作")
+    storage.save_entry(e, "s")
+    e.group = "個人"
+    storage.update_entry(e)
+    assert storage.load_index()[0].group == "個人"
+
+
+def test_password_entry_default_group_empty() -> None:
+    """PasswordEntry.new() 不指定 group 時要預設空字串(代表「未分類」)。"""
+    assert PasswordEntry.new("X", "x.com", "u").group == ""
+
+
+# --- set_entry_order (拖拉排序持久化) --------------------------------------
+
+
+def test_set_entry_order_reorders(fake_keyring, tmp_index, null_locks) -> None:
+    """set_entry_order 應該按指定 id 序列重排 load_index() 結果。"""
+    a = storage.save_entry(PasswordEntry.new("A", "a.com", "u"), "p")
+    b = storage.save_entry(PasswordEntry.new("B", "b.com", "u"), "p")
+    c = storage.save_entry(PasswordEntry.new("C", "c.com", "u"), "p")
+    # 反轉順序
+    storage.set_entry_order([c, b, a])
+    labels = [e.label for e in storage.load_index()]
+    assert labels == ["C", "B", "A"]
+
+
+def test_set_entry_order_preserves_unchanged_entries(
+    fake_keyring, tmp_index, null_locks
+) -> None:
+    """order 漏列既有 id 時,該條目要 append 到尾端、不被丟失。"""
+    a = storage.save_entry(PasswordEntry.new("A", "a.com", "u"), "p")
+    b = storage.save_entry(PasswordEntry.new("B", "b.com", "u"), "p")
+    c = storage.save_entry(PasswordEntry.new("C", "c.com", "u"), "p")
+    # 只列 b,a → c 應被 append
+    storage.set_entry_order([b, a])
+    labels = [e.label for e in storage.load_index()]
+    assert labels == ["B", "A", "C"]
+
+
+def test_set_entry_order_dedups(fake_keyring, tmp_index, null_locks) -> None:
+    """order 內重複的 id 只生效一次(防呆)。"""
+    a = storage.save_entry(PasswordEntry.new("A", "a.com", "u"), "p")
+    b = storage.save_entry(PasswordEntry.new("B", "b.com", "u"), "p")
+    storage.set_entry_order([b, b, a, a])
+    labels = [e.label for e in storage.load_index()]
+    assert labels == ["B", "A"]
+
+
+def test_set_entry_order_does_not_touch_updated_at(
+    fake_keyring, tmp_index, null_locks
+) -> None:
+    """reorder 屬於手動排序,不應更新 updated_at(否則會干擾 query_by_url 命中模式排序)。
+
+    用 id 索引比對,避免誤把「順序不同」當成「值不同」。
+    """
+    a = storage.save_entry(PasswordEntry.new("A", "a.com", "u"), "p")
+    b = storage.save_entry(PasswordEntry.new("B", "b.com", "u"), "p")
+    original = {e.id: e.updated_at for e in storage.load_index()}
+    storage.set_entry_order([b, a])
+    after = {e.id: e.updated_at for e in storage.load_index()}
+    assert original == after, "reorder 不該動到 updated_at"
+    # 順序確實換了
+    assert [e.label for e in storage.load_index()] == ["B", "A"]
+
+
+def test_set_entry_order_does_not_touch_passwords(
+    fake_keyring, tmp_index, null_locks
+) -> None:
+    """reorder 不該動 keyring 裡的密碼(純 metadata 操作)。"""
+    a = storage.save_entry(PasswordEntry.new("A", "a.com", "u"), "secret-A")
+    b = storage.save_entry(PasswordEntry.new("B", "b.com", "u"), "secret-B")
+    storage.set_entry_order([b, a])
+    assert storage.get_password(a) == "secret-A"
+    assert storage.get_password(b) == "secret-B"

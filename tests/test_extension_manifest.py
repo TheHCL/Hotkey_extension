@@ -40,8 +40,58 @@ def test_manifest_referenced_files_exist() -> None:
 def test_popup_html_mentions_key_ids() -> None:
     """popup.html 必須有 popup.js 會用到的元素 id。"""
     html = (EXT_DIR / "popup.html").read_text(encoding="utf-8")
-    for el in ("conn", "matches", "empty", "status", "current-url", "launch-search"):
+    for el in (
+        "conn",
+        "matches",
+        "empty",
+        "status",
+        "current-url",
+        "launch-search",
+        "group-menu",
+    ):
         assert f'id="{el}"' in html, f"popup.html 缺少 #{el}"
+
+
+def test_popup_html_has_group_menu() -> None:
+    """cascading 群組選單結構必須存在。"""
+    html = (EXT_DIR / "popup.html").read_text(encoding="utf-8")
+    assert 'id="group-menu"' in html
+    assert 'class="group-list"' in html or 'id="group-list"' in html
+    # dropdown select 應該拿掉
+    assert 'id="group-filter"' not in html
+
+
+def test_popup_css_has_group_menu_style() -> None:
+    """popup.css 必須為 cascading 群組選單定義樣式。"""
+    css = (EXT_DIR / "popup.css").read_text(encoding="utf-8")
+    assert "#group-menu" in css
+    assert ".entry-list" in css
+    assert ".group-item:hover" in css
+    assert ".group-item.is-open" in css
+    # dropdown 樣式應該移除
+    assert "#group-filter" not in css
+
+
+def test_popup_js_renders_group_menu() -> None:
+    """popup.js 必須用 renderGroupMenu 建 nested DOM,並掛 hover handlers。"""
+    js = (EXT_DIR / "popup.js").read_text(encoding="utf-8")
+    assert "renderGroupMenu" in js
+    assert "group-item" in js
+    assert "group-label" in js
+    assert "entry-list" in js
+    assert "mouseenter" in js
+    assert "mouseleave" in js
+    assert "launchAndFill" in js
+    assert "is-open" in js
+
+
+def test_popup_js_no_dropdown_or_session_group() -> None:
+    """dropdown dropdown state + session 持久化應完全移除(避免殘留 dead code)。"""
+    js = (EXT_DIR / "popup.js").read_text(encoding="utf-8")
+    assert "selectedGroup" not in js
+    assert "popup_group" not in js
+    assert "populateGroupFilter" not in js
+    assert "group-filter" not in js
 
 
 def test_popup_js_uses_chrome_apis() -> None:

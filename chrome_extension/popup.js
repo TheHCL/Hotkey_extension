@@ -1,4 +1,4 @@
-// popup.js — 單一視窗,自動分支:命中時 autofill,未命中時 fallback 列出 launch_url 條目
+// popup.js — 單一視窗,自動分支:命中時 autofill,未命中時 fallback 用 cascading 群組選單
 
 const $conn = document.getElementById("conn");
 const $currentUrl = document.getElementById("current-url");
@@ -6,11 +6,14 @@ const $matches = document.getElementById("matches");
 const $empty = document.getElementById("empty");
 const $status = document.getElementById("status");
 const $launchSearch = document.getElementById("launch-search");
+const $groupMenu = document.getElementById("group-menu");
+const $groupList = document.getElementById("group-list");
 const $navigateToggle = document.getElementById("navigate-toggle");
 
 let currentTabId = null;
 let currentUrl = null;
 let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
+const NO_GROUP = "__none__"; // 空群組的內部 bucket key(只用於排序,不對外顯示)
 
 async function init() {
   // 1. 連線檢查
@@ -82,6 +85,9 @@ async function init() {
   }
   $launchSearch.value = "";
   $launchSearch.addEventListener("input", renderLaunchList);
+
+  // Cascading 群組選單:fallback 模式用,hover 展開該群組條目
+  $groupMenu.hidden = false;
   renderLaunchList();
 }
 
@@ -115,54 +121,95 @@ function renderAutofillList(matches) {
 
 function renderLaunchList() {
   const keyword = $launchSearch.value.trim().toLowerCase();
+  // 先依搜尋過濾(若有)
   let shown = allLaunches;
   if (keyword) {
-    shown = allLaunches.filter(
+    shown = shown.filter(
       (e) =>
         (e.label || "").toLowerCase().includes(keyword) ||
         (e.launch_url || "").toLowerCase().includes(keyword) ||
-        (e.url || "").toLowerCase().includes(keyword)
+        (e.url || "").toLowerCase().includes(keyword) ||
+        (e.group || "").toLowerCase().includes(keyword)
     );
-    if (shown.length === 0) {
-      $matches.innerHTML = "";
-      $matches.hidden = true;
-      showEmpty(`沒有符合「${$launchSearch.value}」的條目`);
-      return;
-    }
   }
 
-  $matches.innerHTML = "";
-  $matches.hidden = false;
-  $empty.hidden = true;
+  if (shown.length === 0) {
+    renderGroupMenu(shown, keyword);
+    if (keyword) {
+      showEmpty(`沒有符合「${$launchSearch.value}」的條目`);
+    } else {
+      showEmpty("沒有可開啟的條目");
+    }
+    return;
+  }
 
-  const MAX_VISIBLE = 8;
-  const sl = shown.slice(0, MAX_VISIBLE);
-  for (const e of sl) {
+  $empty.hidden = true;
+  renderGroupMenu(shown, keyword);
+}
+
+function renderGroupMenu(entries, keyword) {
+  // 清空舊 DOM
+  $groupList.replaceChildren();
+  $groupMenu.hidden = entries.length === 0;
+  if (entries.length === 0) return;
+
+  // 依 allLaunches 第一次出現順序分組
+  const order = [];
+  const buckets = new Map();
+  for (const e of entries) {
+    const key = (e.group || "").trim() || NO_GROUP;
+    if (!buckets.has(key)) {
+      buckets.set(key, []);
+      order.push(key);
+    }
+    buckets.get(key).push(e);
+  }
+
+  const isSearching = !!keyword;
+  for (const key of order) {
+    const items = buckets.get(key);
     const li = document.createElement("li");
-    li.dataset.id = e.id;
+    li.className = "group-item";
+    li.dataset.group = key;
 
     const label = document.createElement("div");
-    label.className = "entry-label";
-    label.textContent = e.label;
-
-    const meta = document.createElement("div");
-    meta.className = "entry-meta";
-    const d = document.createElement("span");
-    d.textContent = e.launch_url;
-    meta.appendChild(d);
-
+    label.className = "group-label";
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = key === NO_GROUP ? "未分類" : key;
+    const countSpan = document.createElement("span");
+    countSpan.className = "count";
+    countSpan.textContent = `${items.length}`;
+    label.appendChild(nameSpan);
+    label.appendChild(countSpan);
     li.appendChild(label);
-    li.appendChild(meta);
-    li.addEventListener("click", () => launchAndFill(e.launch_url, e.id));
-    $matches.appendChild(li);
-  }
 
-  if (shown.length > MAX_VISIBLE) {
-    const note = document.createElement("li");
-    note.className = "matches-overflow";
-    note.textContent = `共 ${shown.length} 筆,僅顯示前 ${MAX_VISIBLE} 筆(請縮小搜尋範圍)`;
-    note.style.cursor = "default";
-    $matches.appendChild(note);
+    const ul = document.createElement("ul");
+    ul.className = "entry-list";
+    for (const e of items) {
+      const entryLi = document.createElement("li");
+      entryLi.dataset.id = e.id;
+      entryLi.textContent = `${e.label}  (${e.launch_url || ""})`;
+      entryLi.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        launchAndFill(e.launch_url, e.id);
+      });
+      ul.appendChild(entryLi);
+    }
+    li.appendChild(ul);
+
+    // hover 展開 / 離開收合(搜尋時永遠展開)
+    li.addEventListener("mouseenter", () => li.classList.add("is-open"));
+    li.addEventListener("mouseleave", () => {
+      if (!isSearching) li.classList.remove("is-open");
+    });
+    // 觸控裝置 fallback:點 label toggle
+    label.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      li.classList.toggle("is-open");
+    });
+
+    if (isSearching) li.classList.add("is-open");
+    $groupList.appendChild(li);
   }
 }
 

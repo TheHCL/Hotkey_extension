@@ -247,6 +247,33 @@ def delete_entry(entry_id: str) -> bool:
     return removed
 
 
+def set_entry_order(ids: list[str]) -> None:
+    """重設整個條目順序。ids 是新的 id 序列。
+
+    - 不在 ids 裡的既有條目會被 append 到尾端(防呆,不被丟失)
+    - 重複的 id 只取第一次出現
+    - 不動 keyring、不呼叫 touch()、不更新 updated_at
+    - 整個操作在單一 index_lock acquisition 內完成
+    """
+    with index_lock(index_path()):
+        data = _read_index_unlocked(index_path())
+        existing: list[dict[str, Any]] = data.get("entries", [])
+        by_id = {e.get("id"): e for e in existing}
+        new_entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for eid in ids:
+            if eid in by_id and eid not in seen:
+                new_entries.append(by_id[eid])
+                seen.add(eid)
+        for e in existing:
+            eid = e.get("id")
+            if eid not in seen:
+                new_entries.append(e)
+                seen.add(eid)
+        data["entries"] = new_entries
+        _atomic_write_json(index_path(), data)
+
+
 def export_all(path: Path) -> int:
     """將所有條目連同密碼匯出成 JSON(明文密碼——僅供使用者自行備份)。回傳筆數。"""
     entries = load_index()

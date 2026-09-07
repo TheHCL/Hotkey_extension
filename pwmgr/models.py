@@ -18,6 +18,7 @@ class PasswordEntry:
     username: str
     notes: str = ""
     launch_url: str = ""  # 一鍵開啟的完整網址(例如 "https://github.com/login");不影響 matching
+    group: str = ""  # 群組/資料夾,例如 "工作"、"個人";空字串 = 未分類
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -30,6 +31,7 @@ class PasswordEntry:
         username: str,
         notes: str = "",
         launch_url: str = "",
+        group: str = "",
     ) -> "PasswordEntry":
         now = time.time()
         return PasswordEntry(
@@ -39,6 +41,7 @@ class PasswordEntry:
             username=username,
             notes=notes,
             launch_url=launch_url,
+            group=group,
             created_at=now,
             updated_at=now,
         )
@@ -58,6 +61,7 @@ class PasswordEntry:
             username=data.get("username", ""),
             notes=data.get("notes", ""),
             launch_url=data.get("launch_url", ""),
+            group=data.get("group", ""),
             created_at=data.get("created_at", 0.0),
             updated_at=data.get("updated_at", 0.0),
         )
