@@ -268,6 +268,79 @@ def test_save_entry_roundtrips_group(fake_keyring, tmp_index, null_locks) -> Non
     assert PasswordEntry.from_dict(raw).group == ""
 
 
+# --- group_colors (每群組展示色票) -------------------------------------------
+
+
+def test_group_colors_default_empty_when_missing(fake_keyring, tmp_index, null_locks) -> None:
+    """索引檔完全沒有 group_colors 鍵時,load_group_colors 應回 {}。"""
+    # 沒存過任何條目也不寫入 index.json,直接讀 group_colors
+    assert storage.load_group_colors() == {}
+
+
+def test_group_colors_round_trip(fake_keyring, tmp_index, null_locks) -> None:
+    """set 後 load 應能讀回來,並 lowercase 化。"""
+    storage.set_group_color("工作", "#3B82F6")
+    storage.set_group_color("個人", "#ef4444")
+    colors = storage.load_group_colors()
+    assert colors == {"工作": "#3b82f6", "個人": "#ef4444"}
+    # 並寫進 index.json 的 group_colors 鍵
+    raw = json.loads(tmp_index.read_text(encoding="utf-8"))
+    assert raw["group_colors"] == {"工作": "#3b82f6", "個人": "#ef4444"}
+
+
+def test_set_group_color_rejects_invalid_hex(fake_keyring, tmp_index, null_locks) -> None:
+    """非法 hex 必須擋下,不可寫入索引(None 是合法移除路徑,不在此測)。"""
+    for bad in ["#abc", "#zzz", "blue", "#12345", "#1234567", "  ", "", 123]:
+        with pytest.raises(storage.BadRequestError):
+            storage.set_group_color("X", bad)
+    # 一次都沒寫進去
+    assert storage.load_group_colors() == {}
+
+
+def test_set_group_color_replaces_not_merges(fake_keyring, tmp_index, null_locks) -> None:
+    """同名稱再 set 一次,要覆蓋,不是合併。"""
+    storage.set_group_color("工作", "#111111")
+    storage.set_group_color("工作", "#222222")
+    assert storage.load_group_colors() == {"工作": "#222222"}
+
+
+def test_set_group_color_none_clears_entry(fake_keyring, tmp_index, null_locks) -> None:
+    """color=None 應移除該 group 的覆寫。"""
+    storage.set_group_color("工作", "#111111")
+    storage.set_group_color("個人", "#222222")
+    storage.set_group_color("工作", None)
+    assert storage.load_group_colors() == {"個人": "#222222"}
+
+
+def test_set_group_color_none_when_already_absent_is_noop(
+    fake_keyring, tmp_index, null_locks
+) -> None:
+    """對不存在的 group 設 None 不該 crash,也不該在索引裡新增空鍵。"""
+    storage.set_group_color("不存在", None)
+    assert storage.load_group_colors() == {}
+    raw = json.loads(tmp_index.read_text(encoding="utf-8"))
+    assert "group_colors" not in raw
+
+
+def test_legacy_index_loads_without_group_colors(fake_keyring, tmp_index, null_locks) -> None:
+    """舊 index.json 沒有 group_colors 鍵時,load_group_colors 仍應回空 dict。"""
+    idx = tmp_index
+    idx.parent.mkdir(parents=True, exist_ok=True)
+    idx.write_text(json.dumps({"version": 1, "entries": []}), encoding="utf-8")
+    assert storage.load_group_colors() == {}
+
+
+def test_group_colors_removed_when_last_entry_cleared(
+    fake_keyring, tmp_index, null_locks
+) -> None:
+    """全部 entry 都清掉後,group_colors 鍵也應從索引消失(不留空 dict)。"""
+    storage.set_group_color("工作", "#111111")
+    assert "group_colors" in json.loads(tmp_index.read_text(encoding="utf-8"))
+    storage.set_group_color("工作", None)
+    raw = json.loads(tmp_index.read_text(encoding="utf-8"))
+    assert "group_colors" not in raw, "全部清掉後 group_colors 鍵不該殘留"
+
+
 def test_update_entry_preserves_group(fake_keyring, tmp_index, null_locks) -> None:
     """update_entry(編輯既有條目、密碼留空的路徑)要能把 group 一起寫進去。"""
     e = PasswordEntry.new("GH", "github.com", "alice", group="工作")

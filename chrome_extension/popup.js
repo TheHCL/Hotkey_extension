@@ -13,6 +13,7 @@ const $navigateToggle = document.getElementById("navigate-toggle");
 let currentTabId = null;
 let currentUrl = null;
 let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
+let groupColors = {}; // {group_name: "#rrggbb"}——使用者透過 PWmgr GUI 設定的覆寫
 const NO_GROUP = "__none__"; // 空群組的內部 bucket key(只用於排序,不對外顯示)
 
 // 每個 group 一個固定色票(hash group 名稱決定),label 背景 + 條目左邊界用對應色
@@ -35,6 +36,37 @@ function groupColorIndex(name) {
     h = ((h << 5) - h + name.charCodeAt(i)) | 0;
   }
   return Math.abs(h) % GROUP_PALETTE.length;
+}
+
+// 派生 {bg, accent}:把使用者自訂的單一 hex 展開成 CSS 用的兩個變數。
+//  - accent = hex 本身(給 .entry-list border-left 用)
+//  - bg     = 與白色混 85%(給 .group-label background 用,確保文字可讀)
+function hexToBgAccent(hex) {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  if (!m) return null;
+  const r = parseInt(m[1], 16);
+  const g = parseInt(m[2], 16);
+  const b = parseInt(m[3], 16);
+  // component-wise mix(hex, #ffffff, t=0.85)
+  const mix = (c) => Math.round(c + (255 - c) * 0.85).toString(16).padStart(2, "0");
+  return {
+    accent: hex.toLowerCase(),
+    bg: `#${mix(r)}${mix(g)}${mix(b)}`,
+  };
+}
+
+// 統一決定某個 group 該用什麼色。優先序:
+//   1. 未分類(NO_GROUP) → NEUTRAL_COLOR(系統固定)
+//   2. 使用者已在 GUI 自訂(groupColorsMap 有) → 派生自該 hex
+//   3. fallback → GROUP_PALette[hash(name)]
+function resolveGroupColor(key, groupColorsMap) {
+  if (key === NO_GROUP) return NEUTRAL_COLOR;
+  const override = groupColorsMap && groupColorsMap[key];
+  if (override) {
+    const derived = hexToBgAccent(override);
+    if (derived) return derived;
+  }
+  return GROUP_PALETTE[groupColorIndex(key)];
 }
 
 async function init() {
@@ -76,6 +108,10 @@ async function init() {
     tabId: currentTabId,
   });
   const matches = (qResp && qResp.ok && qResp.matches) || [];
+  // queryFresh 回傳的 group_colors 是最新的覆寫——
+  // 即使這次命中切到 autofill 路徑,先把色票存起來,
+  // 之後若 toggle 切到 fallback 也拿得到。
+  if (qResp && qResp.group_colors) groupColors = qResp.group_colors;
   if (matches.length > 0) {
     setStatus(`命中 ${matches.length} 筆,點擊自動填入`);
     renderAutofillList(matches);
@@ -98,6 +134,7 @@ async function init() {
     );
     return;
   }
+  if (lResp.group_colors) groupColors = lResp.group_colors;
   allLaunches = (lResp.entries || []).filter((e) => e.launch_url);
   if (allLaunches.length === 0) {
     showEmpty(
@@ -194,11 +231,8 @@ function renderGroupMenu(entries, keyword) {
     li.className = "group-item";
     li.dataset.group = key;
 
-    // 依 group 名稱 hash 決定色票(同名稱永遠同一顏色)
-    const color =
-      key === NO_GROUP
-        ? NEUTRAL_COLOR
-        : GROUP_PALETTE[groupColorIndex(key)];
+    // 解析該 group 的色票:優先用 GUI 自訂的覆寫,fallback 到 hash palette
+    const color = resolveGroupColor(key, groupColors);
     li.style.setProperty("--group-bg", color.bg);
     li.style.setProperty("--group-accent", color.accent);
 

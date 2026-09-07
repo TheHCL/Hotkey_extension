@@ -10,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+import tkinter.colorchooser as colorchooser
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import tkinter.ttk as ttk
@@ -220,6 +221,10 @@ class PwmgrApp:
         file_menu.add_command(label="隱藏到 tray", accelerator="Esc", command=self._hide_to_tray)
         file_menu.add_command(label="結束", command=self._do_quit)
         menubar.add_cascade(label="檔案", menu=file_menu)
+
+        group_menu = tk.Menu(menubar, tearoff=False)
+        group_menu.add_command(label="編輯群組顏色...", command=self._open_group_colors_dialog)
+        menubar.add_cascade(label="群組", menu=group_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="關於 PWmgr", command=self._show_about)
@@ -957,6 +962,172 @@ class PwmgrApp:
             self.root.destroy()
         except tk.TclError:
             pass
+
+    # --- 群組顏色對話框 -------------------------------------------------------
+
+    def _open_group_colors_dialog(self) -> None:
+        """彈出「編輯群組顏色」對話框。每個唯一群組一列(第一次出現順序),可選色或重設。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("編輯群組顏色")
+        dlg.transient(self.root)
+        dlg.configure(background=PALETTE["bg"])
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        # 讓 dialog 有合理大小、置中在主視窗
+        dlg.geometry("520x520")
+        dlg.minsize(420, 320)
+
+        # ---- header ----
+        body = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 16))
+        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+        ttk.Label(body, text="編輯群組顏色", style="Header.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            body,
+            text="替每個群組挑一個代表色,Chrome 擴充功能的群組選單會優先採用這裡的設定。",
+            style="CardMuted.TLabel",
+            wraplength=460,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(6, 12))
+
+        # ---- 群組清單(滾動區) ----
+        list_outer = ttk.Frame(body, style="Card.TFrame", padding=1)
+        list_outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(list_outer, highlightthickness=0, background=PALETTE["card"], borderwidth=0)
+        sb = ttk.Scrollbar(list_outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        rows_frame = ttk.Frame(canvas, style="Card.TFrame", padding=(12, 8))
+        canvas_window = canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+        rows_frame.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(canvas_window, width=e.width),
+        )
+        # 滾輪支援(Windows/macOS/Linux 各一隻滑鼠差異)
+        def _on_wheel(e, c=canvas):
+            try:
+                delta = e.delta
+            except AttributeError:
+                delta = 0
+            if delta:
+                c.yview_scroll(int(-delta / 120), "units")
+            elif getattr(e, "num", None) in (4, 5):
+                c.yview_scroll(-1 if e.num == 4 else 1, "units")
+        canvas.bind("<MouseWheel>", _on_wheel)
+        canvas.bind("<Button-4>", _on_wheel)
+        canvas.bind("<Button-5>", _on_wheel)
+
+        # ---- 抓取資料:群組首次出現順序去重 ----
+        NO_GROUP = "__none__"
+        seen_groups: list[str] = []
+        seen: set[str] = set()
+        for e in self._entries:
+            key = (e.group or "").strip() or NO_GROUP
+            if key not in seen:
+                seen.add(key)
+                seen_groups.append(key)
+
+        if not seen_groups:
+            ttk.Label(
+                rows_frame,
+                text="目前沒有任何群組。請先在「群組」欄位填寫名稱後,這裡才能挑色。",
+                style="CardMuted.TLabel",
+                wraplength=440,
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, pady=12)
+
+        # 預先載入 group_colors,避免每列都打 disk
+        try:
+            current_colors = storage.load_group_colors()
+        except Exception:
+            current_colors = {}
+
+        # 每個群組一行 — 第一個欄位為 group_iid(隱藏),用於 revert 時識別
+        def _refresh_swatch(group_key: str, swatch: tk.Canvas, hex_label: ttk.Label) -> None:
+            """重讀 group_colors,更新對應行的 swatch + hex label。"""
+            try:
+                colors = storage.load_group_colors()
+            except Exception:
+                colors = {}
+            color = colors.get(group_key)
+            swatch.configure(background=color or "#ffffff")
+            hex_label.configure(text=color or "自動")
+
+        def _pick(group_key: str, swatch: tk.Canvas, hex_label: ttk.Label) -> None:
+            try:
+                colors = storage.load_group_colors()
+            except Exception:
+                colors = {}
+            current = colors.get(group_key) or "#888888"
+            try:
+                result = colorchooser.askcolor(
+                    parent=dlg,
+                    initialcolor=current,
+                    title=f"選擇「{group_key}」的顏色",
+                )
+            except Exception as e:
+                messagebox.showerror("選色失敗", f"{type(e).__name__}: {e}", parent=dlg)
+                return
+            # askcolor 回 ((r, g, b), "#rrggbb");cancel 回 (None, None)
+            _, hex_str = result if isinstance(result, tuple) else (None, None)
+            if not hex_str:
+                return  # 使用者按 Cancel
+            hex_clean = hex_str.lower()
+            try:
+                storage.set_group_color(group_key, hex_clean)
+            except storage.BadRequestError as e:
+                messagebox.showerror("顏色不合法", str(e), parent=dlg)
+                return
+            except Exception as e:
+                messagebox.showerror("儲存失敗", f"{type(e).__name__}: {e}", parent=dlg)
+                return
+            _refresh_swatch(group_key, swatch, hex_label)
+            self._set_status(f'已更新「{group_key}」的顏色:{hex_clean}')
+
+        def _reset(group_key: str, swatch: tk.Canvas, hex_label: ttk.Label) -> None:
+            try:
+                storage.set_group_color(group_key, None)
+            except Exception as e:
+                messagebox.showerror("重設失敗", f"{type(e).__name__}: {e}", parent=dlg)
+                return
+            _refresh_swatch(group_key, swatch, hex_label)
+            self._set_status(f'已重設「{group_key}」的顏色')
+
+        for group_key in seen_groups:
+            display = "未分類" if group_key == NO_GROUP else group_key
+            # 跳過未分類(用 NEUTRAL_COLOR、不存 group_colors)
+            if group_key == NO_GROUP:
+                row = ttk.Frame(rows_frame, style="Card.TFrame", padding=(8, 8))
+                row.pack(fill=tk.X, pady=4)
+                ttk.Label(row, text=display, style="Card.TLabel").pack(side=tk.LEFT, padx=(0, 12))
+                ttk.Label(row, text="中性灰(固定)", style="CardMuted.TLabel").pack(side=tk.LEFT)
+                continue
+            row = ttk.Frame(rows_frame, style="Card.TFrame", padding=(8, 8))
+            row.pack(fill=tk.X, pady=4)
+            ttk.Label(row, text=display, style="Card.TLabel", width=20, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 12))
+            initial_color = current_colors.get(group_key) or "#ffffff"
+            swatch = tk.Canvas(row, width=32, height=18, highlightthickness=1, highlightbackground=PALETTE["border"], background=initial_color, borderwidth=0)
+            swatch.pack(side=tk.LEFT, padx=(0, 10))
+            hex_label = ttk.Label(row, text=current_colors.get(group_key) or "自動", style="Card.TLabel", width=10, anchor=tk.W)
+            hex_label.pack(side=tk.LEFT, padx=(0, 10))
+            ttk.Button(row, text="選色…", width=8, command=lambda g=group_key, s=swatch, h=hex_label: _pick(g, s, h)).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(row, text="重設", style="Danger.TButton", command=lambda g=group_key, s=swatch, h=hex_label: _reset(g, s, h)).pack(side=tk.LEFT)
+
+        # ---- footer ----
+        footer = ttk.Frame(dlg, padding=(14, 0, 14, 14))
+        footer.pack(fill=tk.X)
+        ttk.Button(footer, text="關閉", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        # 焦點與綁 Escape 關閉
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.focus_set()
 
     # --- 工具 ----------------------------------------------------------------
 

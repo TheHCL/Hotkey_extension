@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -41,6 +42,10 @@ class NotesTooLongError(ValueError):
 
 class EntryNotFoundError(KeyError):
     """指定 id 不存在。"""
+
+
+class BadRequestError(ValueError):
+    """原生主機收到不合法的 request(例如非法 hex 顏色)。"""
 
 
 # --- keyring 抽象(可被測試 monkeypatch) ---------------------------------------
@@ -368,4 +373,70 @@ def read_current_url() -> str | None:
         return None
     url = data.get("url")
     return url if isinstance(url, str) and url else None
+
+
+# --- group_colors(每個群組的展示色票) -----------------------------------------
+
+
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _validate_hex_color(value: Any) -> str:
+    """驗證並標準化十六進色碼為 lowercase #rrggbb。"""
+    if not isinstance(value, str) or not _HEX_RE.match(value):
+        raise BadRequestError("color 必須是 #rrggbb 形式")
+    return value.lower()
+
+
+def _normalize_group_colors(raw: Any) -> dict[str, str]:
+    """防禦性讀取:把磁碟上各種格式的 group_colors 標準化為 {name: #rrggbb}。
+
+    - 非 dict → {}
+    - 非字串 key / 非合法 hex value → 跳過那筆(不影響其他)
+    - 全部 lowercase
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            normalized = _validate_hex_color(v)
+        except BadRequestError:
+            continue
+        out[k] = normalized
+    return out
+
+
+def load_group_colors() -> dict[str, str]:
+    """在 index_lock 內讀取 {group_name: #rrggbb}。缺鍵或格式錯一律回空 dict。"""
+    with index_lock(index_path()):
+        data = _read_index_unlocked(index_path())
+    return _normalize_group_colors(data.get("group_colors"))
+
+
+def set_group_color(group: str, color: str | None) -> None:
+    """單筆設定/移除某個 group 的展示色。
+
+    - group:群組字串(已通過 native host 的 _normalize_group 正規化)
+    - color:#rrggbb 形式設定進去;None 表示移除
+
+    為避免磁碟上殘留空 dict,當全部移除乾淨時把 group_colors 鍵整個清掉。
+    """
+    with index_lock(index_path()):
+        data = _read_index_unlocked(index_path())
+        raw = data.get("group_colors")
+        colors = _normalize_group_colors(raw)
+        if color is None:
+            colors.pop(group, None)
+        else:
+            # 雙重驗證:_validate_hex_color 在 native host 已經收過一次,
+            # storage 這層是 defense-in-depth,萬一 GUI 端直接呼叫也擋。
+            colors[group] = _validate_hex_color(color)
+        if colors:
+            data["group_colors"] = colors
+        else:
+            data.pop("group_colors", None)
+        _atomic_write_json(index_path(), data)
 

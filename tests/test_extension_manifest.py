@@ -253,3 +253,20 @@ def test_content_js_claims_pending_fill_on_startup() -> None:
     js = (EXT_DIR / "content.js").read_text(encoding="utf-8")
     assert "claimPendingFill" in js
     assert "fillForm" in js
+
+
+# --- 群組顏色覆寫 (popup 使用 GUI 的 group_colors) -------------------------
+
+
+def test_popup_js_uses_group_colors_override() -> None:
+    """popup.js 必須讀取後端回傳的 group_colors 並用它覆寫預設 palette。"""
+    js = (EXT_DIR / "popup.js").read_text(encoding="utf-8")
+    # 接收後端回傳的 group_colors 欄位
+    assert "group_colors" in js, "popup.js 應讀取後端的 group_colors 欄位"
+    # 還要有解析覆寫的 helper
+    assert "resolveGroupColor" in js, "popup.js 應有 resolveGroupColor 解析覆寫"
+    # 但原本的 hash palette + 未分類中性色仍要保留(向下相容)
+    assert "GROUP_PALETTE" in js
+    assert "NEUTRAL_COLOR" in js
+    # 派生 {bg, accent} 的工具函式(把單一 hex 展開)
+    assert "hexToBgAccent" in js

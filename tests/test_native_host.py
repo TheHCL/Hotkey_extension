@@ -448,3 +448,138 @@ def test_native_update_existing_with_group(isolated, fake_keyring) -> None:
     out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
     r = _read_message(io.BytesIO(out))
     assert r["entry"]["group"] == "個人"
+
+
+# --- group_colors(原生主機端) ----------------------------------------------
+
+
+def test_get_group_colors_empty_when_unset(isolated, fake_keyring) -> None:
+    """沒設過任何 group_colors 應回空 dict。"""
+    out = _drive_loop(_encode_message({"type": "get_group_colors"}))
+    r = _read_message(io.BytesIO(out))
+    assert r == {"ok": True, "group_colors": {}}
+
+
+def test_set_group_color_persists_then_query_carries(isolated, fake_keyring) -> None:
+    """set 完一個群組色後,後續 query / list 都應帶 group_colors。"""
+    set_msg = _encode_message({
+        "type": "set_group_color",
+        "group": "工作",
+        "color": "#3B82F6",
+    })
+    r = _read_message(io.BytesIO(_drive_loop(set_msg)))
+    assert r["ok"] is True
+
+    # 先建一筆命中條目以便 query 有內容
+    msgs = b"".join([
+        _encode_message({
+            "type": "save",
+            "entry": {
+                "label": "GH",
+                "url": "github.com",
+                "username": "alice",
+                "group": "工作",
+            },
+            "password": "p",
+        }),
+        _encode_message({"type": "query", "url": "https://github.com/"}),
+    ])
+    out = _drive_loop(msgs)
+    s = io.BytesIO(out)
+    _read_message(s)  # save
+    q = _read_message(s)
+    assert q["ok"] is True
+    assert q.get("group_colors") == {"工作": "#3b82f6"}, (
+        f"group_colors 應該帶在 query 回應,實際:{q.get('group_colors')!r}"
+    )
+
+    # list 也應帶
+    out2 = _drive_loop(_encode_message({"type": "list"}))
+    l = _read_message(io.BytesIO(out2))
+    assert l.get("group_colors") == {"工作": "#3b82f6"}
+
+
+def test_set_group_color_rejects_bad_hex(isolated, fake_keyring) -> None:
+    """color 不是 #rrggbb 形式 → BAD_REQUEST,不可寫入。"""
+    for bad in ["blue", "#abc", "#zzzzzz", "  ", 42, "#1234567"]:
+        out = _drive_loop(_encode_message({
+            "type": "set_group_color",
+            "group": "工作",
+            "color": bad,
+        }))
+        r = _read_message(io.BytesIO(out))
+        assert r["code"] == "BAD_REQUEST", f"{bad!r} 應該被擋,實際:{r}"
+    # 確認完全沒寫進去
+    out = _drive_loop(_encode_message({"type": "get_group_colors"}))
+    g = _read_message(io.BytesIO(out))
+    assert g["group_colors"] == {}
+
+
+def test_set_group_color_null_clears(isolated, fake_keyring) -> None:
+    """color:null 應移除該 group 的覆寫。"""
+    _drive_loop(_encode_message({
+        "type": "set_group_color", "group": "工作", "color": "#111111"
+    }))
+    _drive_loop(_encode_message({
+        "type": "set_group_color", "group": "個人", "color": "#222222"
+    }))
+
+    # 移除「工作」
+    out = _drive_loop(_encode_message({
+        "type": "set_group_color", "group": "工作", "color": None
+    }))
+    r = _read_message(io.BytesIO(out))
+    assert r["ok"] is True
+
+    out2 = _drive_loop(_encode_message({"type": "get_group_colors"}))
+    g = _read_message(io.BytesIO(out2))
+    assert g["group_colors"] == {"個人": "#222222"}
+
+
+def test_set_group_color_rejects_empty_group(isolated, fake_keyring) -> None:
+    """空字串 group 必須被擋下(BAD_REQUEST)——不該為「未分類」開新視窗。"""
+    out = _drive_loop(_encode_message({
+        "type": "set_group_color", "group": "", "color": "#111111"
+    }))
+    r = _read_message(io.BytesIO(out))
+    assert r["code"] == "BAD_REQUEST"
+
+
+def test_set_group_color_rejects_missing_group(isolated, fake_keyring) -> None:
+    """group 欄位缺漏視為 None → BAD_REQUEST。"""
+    out = _drive_loop(_encode_message({
+        "type": "set_group_color", "color": "#111111"
+    }))
+    r = _read_message(io.BytesIO(out))
+    assert r["code"] == "BAD_REQUEST"
+
+
+def test_set_group_color_oversized_group_rejected(isolated, fake_keyring) -> None:
+    """group 超過 MAX_GROUP_CHARS 要被 _normalize_group 擋下。"""
+    from pwmgr.config import MAX_GROUP_CHARS
+
+    out = _drive_loop(_encode_message({
+        "type": "set_group_color",
+        "group": "x" * (MAX_GROUP_CHARS + 1),
+        "color": "#111111",
+    }))
+    r = _read_message(io.BytesIO(out))
+    assert r["code"] == "BAD_REQUEST"
+
+
+def test_query_response_carries_group_colors(isolated, fake_keyring) -> None:
+    """即使 group_colors 為空也要帶 group_colors 鍵(forward-compat 信號)。"""
+    out = _drive_loop(_encode_message({"type": "query", "url": "https://no-match/"}))
+    r = _read_message(io.BytesIO(out))
+    assert r["ok"] is True
+    assert "group_colors" in r
+    assert r["group_colors"] == {}
+
+
+def test_list_response_carries_group_colors(isolated, fake_keyring) -> None:
+    """list 即使零筆也要帶 group_colors 鍵(forward-compat 信號)。"""
+    out = _drive_loop(_encode_message({"type": "list"}))
+    r = _read_message(io.BytesIO(out))
+    assert r["ok"] is True
+    assert "group_colors" in r
+    assert r["group_colors"] == {}

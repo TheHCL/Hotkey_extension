@@ -12,6 +12,7 @@ Chrome 規格:https://developer.chrome.com/docs/extensions/develop/concepts/nati
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 import threading
@@ -20,6 +21,8 @@ from typing import Any
 from . import storage
 from .config import MAX_GROUP_CHARS, MAX_PASSWORD_BYTES
 from .models import PasswordEntry
+
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # --- 例外 --------------------------------------------------------------------
 
@@ -112,6 +115,7 @@ def _handle_query(req: dict[str, Any]) -> dict[str, Any]:
             }
             for e in matches
         ],
+        "group_colors": storage.load_group_colors(),
     }
 
 
@@ -131,6 +135,7 @@ def _handle_list(_req: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "entries": [e.to_dict() for e in storage.load_index()],
+        "group_colors": storage.load_group_colors(),
     }
 
 
@@ -193,6 +198,30 @@ def _handle_ping(_req: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "pong": True}
 
 
+def _handle_get_group_colors(_req: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "group_colors": storage.load_group_colors()}
+
+
+def _handle_set_group_color(req: dict[str, Any]) -> dict[str, Any]:
+    """設定(或移除,color=null)某個 group 的展示色。"""
+    group = _normalize_group(req.get("group", ""))
+    # _normalize_group 允許空字串("未分類"在 GUI 用空字串表示)
+    # 但 group_colors 不該為空字串(既不會被視為一個有意義的群組,
+    # 也避免和未分類本身的 NEUTRAL_COLOR 衝突)
+    if not group:
+        raise BadRequestError("group 不可為空字串")
+    color_raw = req.get("color")
+    if color_raw is None:
+        # 移除路徑
+        storage.set_group_color(group, None)
+        return {"ok": True}
+    # 設定路徑:同一個 regex 在 storage 層再驗一次(defense-in-depth)
+    if not isinstance(color_raw, str) or not _HEX_RE.match(color_raw):
+        raise BadRequestError("color 必須是 #rrggbb 形式")
+    storage.set_group_color(group, color_raw.lower())
+    return {"ok": True}
+
+
 _DISPATCH: dict[str, Any] = {
     "query": _handle_query,
     "fetch": _handle_fetch,
@@ -201,6 +230,8 @@ _DISPATCH: dict[str, Any] = {
     "delete": _handle_delete,
     "report_url": _handle_report_url,
     "ping": _handle_ping,
+    "get_group_colors": _handle_get_group_colors,
+    "set_group_color": _handle_set_group_color,
 }
 
 
@@ -279,6 +310,8 @@ def run() -> int:
         except storage.BusyError:
             resp = NativeHostError("BUSY", "密碼管理員忙碌中,稍後重試").to_dict()
         except BadRequestError as e:
+            resp = NativeHostError("BAD_REQUEST", str(e)).to_dict()
+        except storage.BadRequestError as e:
             resp = NativeHostError("BAD_REQUEST", str(e)).to_dict()
         except Exception as e:
             resp = NativeHostError("INTERNAL", f"{type(e).__name__}: {e}").to_dict()

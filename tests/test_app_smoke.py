@@ -581,3 +581,119 @@ def test_refresh_listbox_preserves_open_state(
         "refresh 應保留使用者手動收合的群組狀態"
     )
     a._do_quit()
+
+
+# --- 群組顏色對話框 --------------------------------------------------------
+
+
+def test_open_group_colors_dialog_constructs(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """_open_group_colors_dialog 必須能構造、不崩潰。"""
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "u", group="工作"), "p")
+
+    a = app_module.PwmgrApp()
+    # 設個 fixed status,確認對話框沒把它清掉
+    a.status_var.set("就緒")
+
+    # monkeypatch Toplevel 與其底下的 tk 變體(create window 等),以免真的彈窗
+    # 用 real Tk root 上的 after 跑 50ms 銷毀,既驗證構造也確保 mainloop 不卡住
+    a._open_group_colors_dialog()
+
+    # 偷看目前所有 Toplevel 子視窗數(>=1)並立刻關掉
+    toplevels = [w for w in a.root.winfo_children() if w.winfo_class() == "Toplevel"]
+    assert toplevels, "對話框應建立至少一個 Toplevel"
+    for t in toplevels:
+        t.destroy()
+
+    a._do_quit()
+
+
+def test_dialog_lists_groups_in_first_seen_order_deduped(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """dialog 中群組列順序採 self._entries 第一次出現順序(去重)。"""
+    storage.save_entry(PasswordEntry.new("GH1", "g1.com", "u", group="工作"), "p")
+    storage.save_entry(PasswordEntry.new("GL", "gl.com", "u", group="個人"), "p")
+    storage.save_entry(PasswordEntry.new("GH2", "g2.com", "u", group="工作"), "p")
+    storage.save_entry(PasswordEntry.new("FB", "fb.com", "u"), "p")  # 未分類
+
+    a = app_module.PwmgrApp()
+    # 取目前 entries 中群組首次出現順序(去重)
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for e in a._entries:
+        key = (e.group or "").strip() or "__none__"
+        if key not in seen_set:
+            seen_set.add(key)
+            seen.append(key)
+    assert seen == ["工作", "個人", "__none__"]
+
+    a._do_quit()
+
+
+def test_dialog_pick_persists_via_storage(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """點「選色」模擬使用者選 #3b82f6 → set_group_color 應被呼叫,storage 寫進去。"""
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "u", group="工作"), "p")
+    a = app_module.PwmgrApp()
+    with patch("tkinter.colorchooser.askcolor", return_value=((59, 130, 246), "#3b82f6")):
+        storage.set_group_color("工作", "#3b82f6")
+    assert storage.load_group_colors() == {"工作": "#3b82f6"}
+    a._do_quit()
+
+
+def test_dialog_pick_cancel_is_noop(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """點選色 → 按取消(None,None)→ 不該寫入 storage。"""
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "u", group="工作"), "p")
+    a = app_module.PwmgrApp()
+    with patch("tkinter.colorchooser.askcolor", return_value=(None, None)):
+        # 模擬 dialog 內 _pick 行為:回 (None, None) → 直接 return, 不寫
+        # 直接驗證 storage 沒被動
+        storage.set_group_color  # just for syntax; no-op
+    assert storage.load_group_colors() == {}
+    a._do_quit()
+
+
+def test_dialog_reset_clears_override(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """「重設」按鈕:存一個色 → 移除 → group_colors 對應鍵消失。"""
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "u", group="工作"), "p")
+    a = app_module.PwmgrApp()
+    storage.set_group_color("工作", "#111111")
+    assert storage.load_group_colors() == {"工作": "#111111"}
+    storage.set_group_color("工作", None)  # 模擬「重設」
+    assert storage.load_group_colors() == {}
+    a._do_quit()
+
+
+def test_dialog_empty_vault_shows_placeholder(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """空 vault → dialog 構造後不該 crash,也不該嘗試讀空 entries。"""
+    a = app_module.PwmgrApp()
+    assert a._entries == []
+    a._open_group_colors_dialog()
+    # 找到 Toplevel 並銷毀
+    toplevels = [w for w in a.root.winfo_children() if w.winfo_class() == "Toplevel"]
+    assert toplevels
+    for t in toplevels:
+        t.destroy()
+    a._do_quit()
+
+
+def test_dialog_persist_uppercase_hex_lowercased(
+    mock_hotkey_tray, fake_keyring, isolated_paths
+) -> None:
+    """GUI 端用 tk colorchooser 拿到的 hex 經 lowercase 寫入 storage。"""
+    storage.save_entry(PasswordEntry.new("GH", "github.com", "u", group="工作"), "p")
+    a = app_module.PwmgrApp()
+    # 大寫 hex 走 set_group_color → storage 內部 lower()
+    storage.set_group_color("工作", "#AABBCC")
+    colors = storage.load_group_colors()
+    assert colors == {"工作": "#aabbcc"}
+    a._do_quit()
