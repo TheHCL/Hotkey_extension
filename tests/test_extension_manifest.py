@@ -186,3 +186,20 @@ def test_background_cleanup_pending_on_tab_removed() -> None:
     js = (EXT_DIR / "background.js").read_text(encoding="utf-8")
     assert "clearPendingFill" in js
     assert "chrome.tabs.onRemoved" in js
+
+
+def test_background_uses_storage_session_for_pending_fill() -> None:
+    """pendingFill 同步寫到 chrome.storage.session,content script 主動 pull,
+    解決 MV3 sendMessage 與 listener attach 之間的 race condition。"""
+    js = (EXT_DIR / "background.js").read_text(encoding="utf-8")
+    assert "chrome.storage.session.set" in js
+    assert "chrome.storage.session.get" in js
+    assert "chrome.storage.session.remove" in js
+    assert "claimPendingFill" in js
+
+
+def test_content_js_claims_pending_fill_on_startup() -> None:
+    """content.js 啟動後主動 sendMessage claimPendingFill 拉 credentials。"""
+    js = (EXT_DIR / "content.js").read_text(encoding="utf-8")
+    assert "claimPendingFill" in js
+    assert "fillForm" in js

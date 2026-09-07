@@ -12,6 +12,7 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "fill") {
+      console.log("[pwmgr] content received fill", msg.username ? "(has username)" : "(no username)");
       try {
         fillForm(msg.username || "", msg.password || "");
       } catch (e) {
@@ -21,6 +22,26 @@
       }
     }
   });
+
+  // 啟動後主動問 background 有沒有 pending fill(解決 MV3 sendMessage 與
+  // content script listener attach 之間的 race condition)
+  setTimeout(function () {
+    // 從 window 或 message sender 拿 tabId(content script 沒有直接的 tabId API,
+    // 改由 background 從 sender.tab.id 推斷;若 sender 沒給,我們仍送但不帶 tabId,
+    // background 會從 storage 比對)
+    chrome.runtime.sendMessage({ type: "claimPendingFill" }, function (resp) {
+      if (resp && resp.ok && resp.username != null) {
+        console.log("[pwmgr] content claimed pending fill");
+        try {
+          fillForm(resp.username || "", resp.password || "");
+        } catch (e) {
+          console.warn("[pwmgr] claim fill error:", e);
+        } finally {
+          window.__pwmgr_filling__ = false;
+        }
+      }
+    });
+  }, 200);
 
   function fillForm(username, password) {
     const passwordInputs = findPasswordCandidates();
@@ -32,7 +53,10 @@
         console.log("[pwmgr] 尚無密碼欄位,已先填帳號,等待密碼欄位出現");
         waitForPasswordField(username, password);
       } else {
-        console.log("[pwmgr] 找不到密碼輸入欄位");
+        // 頁面還在 SPA 載入中、連帳號欄位都還沒 render。
+        // 等任何 input 出現後再嘗試一次(整個流程重來)。
+        console.log("[pwmgr] 頁面還沒 render input,等待 input 出現後重試 fill");
+        waitForAnyInput(username, password);
       }
       return;
     }
@@ -69,11 +93,15 @@
   }
 
   function fillUsernameOnly(username) {
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
-      )
-    ).filter((el) => isUsable(el) && !looksLikePasswordField(el));
+    const allInputs = Array.from(document.querySelectorAll("input"));
+    const usableList = allInputs.filter((el) => isUsable(el) && !looksLikePasswordField(el));
+    console.log("[pwmgr] fillUsernameOnly candidates", usableList.length, "/ total inputs:", allInputs.length);
+    if (allInputs.length > 0 && usableList.length === 0) {
+      console.log("[pwmgr] no usable input; all inputs:", allInputs.map(function (el) {
+        return { id: el.id, name: el.name, type: el.type, hidden: el.offsetParent === null, rect: { w: el.getBoundingClientRect().width, h: el.getBoundingClientRect().height } };
+      }));
+    }
+    const candidates = usableList;
     if (candidates.length === 0) return false;
     const best =
       candidates.find((el) => (el.autocomplete || "").toLowerCase().includes("username")) ||
@@ -116,6 +144,38 @@
       done = true;
       cleanup();
       console.log("[pwmgr] 等待密碼欄位逾時,放棄補填");
+    }, timeoutMs);
+  }
+
+  // SPA 載入延遲:整個頁面連一個 input 都還沒 render。
+  // 等任何 input 出現後整個 fillForm 流程重跑一次。
+  function waitForAnyInput(username, password, timeoutMs) {
+    timeoutMs = timeoutMs || 60000;
+    let done = false;
+    const cleanup = () => {
+      observer.disconnect();
+      clearInterval(pollId);
+      clearTimeout(timeoutId);
+    };
+    const tryFill = () => {
+      if (done) return;
+      if (document.querySelectorAll("input").length === 0) return;
+      done = true;
+      cleanup();
+      console.log("[pwmgr] 偵測到 input 出現,重試 fillForm");
+      fillForm(username, password);
+    };
+    const observer = new MutationObserver(tryFill);
+    observer.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+    });
+    const pollId = setInterval(tryFill, 300);
+    const timeoutId = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      console.log("[pwmgr] 等待任何 input 逾時,放棄");
     }, timeoutMs);
   }
 

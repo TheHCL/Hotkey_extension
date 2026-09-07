@@ -46,6 +46,11 @@ function setPendingFill(tabId, creds) {
     clearPendingFill(tabId);
   }, PENDING_FILL_TTL_MS);
   pendingFill[tabId] = { username: creds.username, password: creds.password, url: creds.url, timer: timer };
+  // 同步寫到 chrome.storage.session,讓 service worker 重啟 / content script race
+  // condition 後仍可由 content script 主動 pull
+  chrome.storage.session.set({ pendingFill: { tabId: tabId, username: creds.username, password: creds.password, url: creds.url } }).catch(function (e) {
+    console.warn("[pwmgr] storage.session.set failed", e && e.message || e);
+  });
 }
 
 function clearPendingFill(tabId) {
@@ -53,6 +58,12 @@ function clearPendingFill(tabId) {
   if (!p) return;
   clearTimeout(p.timer);
   delete pendingFill[tabId];
+  // 從 storage.session 清掉(只清匹配的 tabId)
+  chrome.storage.session.get("pendingFill", function (data) {
+    if (data && data.pendingFill && data.pendingFill.tabId === tabId) {
+      chrome.storage.session.remove("pendingFill");
+    }
+  });
 }
 
 function sendNative(msg) {
@@ -147,15 +158,33 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     onTabUrlChange(tabId, tab.url);
   }
 
-  // launchAndFill:新分頁 render 完 → 送 fill 訊息
+  // launchAndFill:新分頁 render 完 → 送 fill 訊息(重試直到 content script ready 或 timeout)
   if (changeInfo.status === "complete" && pendingFill[tabId]) {
     const creds = pendingFill[tabId];
-    clearPendingFill(tabId);
-    chrome.tabs.sendMessage(tabId, { type: "fill", username: creds.username, password: creds.password }).catch(function () {
-      // content script 可能未注入(non-http 跳轉)
-    });
+    // 不立刻 clearPendingFill — 重試期間仍要保留
+    console.log("[pwmgr] onUpdated complete, will retry-send fill to tab", tabId);
+    sendFillWithRetry(tabId, creds);
   }
 });
+
+function sendFillWithRetry(tabId, creds, attempt) {
+  attempt = attempt || 0;
+  const maxAttempts = 10;
+  chrome.tabs.sendMessage(tabId, { type: "fill", username: creds.username, password: creds.password }).then(function () {
+    console.log("[pwmgr] fill sent ok to tab", tabId, "after", attempt, "retries");
+    clearPendingFill(tabId);
+  }).catch(function (e) {
+    if (attempt >= maxAttempts) {
+      console.warn("[pwmgr] fill sendMessage failed after", maxAttempts, "attempts for tab", tabId, e && e.message || e);
+      clearPendingFill(tabId);
+      return;
+    }
+    // 500ms / 1s / 1.5s / ... / 5s(等差遞增)
+    const delay = Math.min(500 + attempt * 500, 5000);
+    console.log("[pwmgr] fill sendMessage retry in", delay, "ms (attempt", attempt + 1, ")");
+    setTimeout(function () { sendFillWithRetry(tabId, creds, attempt + 1); }, delay);
+  });
+}
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   try {
@@ -250,6 +279,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, code: "TAB_CREATE_FAIL", error: String(e) });
       }
     })();
+    return true;
+  }
+
+  if (msg.type === "claimPendingFill") {
+    // content script 啟動後主動問「有沒有 pending fill 給我這個 tab?」
+    // 解 MV3 sendMessage 與 listener attach 之間的 race condition
+    const senderTabId = _sender && _sender.tab && _sender.tab.id;
+    chrome.storage.session.get("pendingFill", function (data) {
+      const p = data && data.pendingFill;
+      if (!p || p.tabId !== senderTabId) {
+        sendResponse({ ok: false, code: "NO_PENDING" });
+        return;
+      }
+      // 找到對應的 pending fill → 送給 content script,清掉
+      clearPendingFill(senderTabId);
+      sendResponse({ ok: true, username: p.username, password: p.password, url: p.url });
+    });
     return true;
   }
 
