@@ -28,6 +28,7 @@
 - **Chrome / Edge 擴充功能** — 偵測目前 tab 的 URL、查詢本機 vault、一鍵自動填入帳密;支援 fallback vault browser(未命中時列出全部有 `launch_url` 的條目,點擊自動開新分頁+等 render+填入),可從 popup footer 開關此功能。
 - **20 秒自動清空剪貼簿** — 複製密碼後 20 秒自動清除,降低肩窺風險。
 - **支援多帳號** — 同一網域可存多組帳密(如 `github.com` 個人 + 公司帳)。
+- **群組顏色自訂** — 在 GUI「群組 → 編輯群組顏色…」為每個群組指定色票;Chrome 擴充 popup 的 cascading 群組選單會跟著套用(未分類固定中性灰)。
 
 ## 架構
 
@@ -191,6 +192,7 @@ python packaging\build.py
 3. 工具列右側 PWmgr 圖示上會出現 badge 數字(命中條目數)
 4. footer 的「**啟用未命中頁面的條目快選**」checkbox 控制 fallback 模式是否啟用——toggle 為 OFF 時未命中頁只剩空狀態提示,符合「只要 autofill 不要 vault 快選」的使用情境。設定用 `chrome.storage.sync` 持久化,會跨裝置同步。
 5. 適合「你在 yahoo.com 想直接到 github 設定頁」這類跨站跳轉:popup 一打開就 fallback,打字「github」、點開,新分頁載完就自動填好。
+6. 群組選單的 label 背景色與左邊界 accent 色,預設從 8 色调色盤按群組名稱 hash 挑;**若在 GUI「群組 → 編輯群組顏色…」改過,popup 會直接套用該色**(accent 用 hex 原色,bg 用 hex 跟白色 0.85 混合確保文字可讀)。未分類固定中性灰,不會被覆寫。
 
 **底層流程**:
 
@@ -338,9 +340,10 @@ pytest tests/ -v
 ### 測試涵蓋
 
 - `tests/test_matcher.py` — URL 比對 table-driven(30+ cases)
-- `tests/test_storage.py` — CRUD、2560 byte 限制、lock 衝突、損壞 index 還原
-- `tests/test_native_host.py` — stdin/stdout 模擬,所有訊息類型 + 錯誤路徑
-- `tests/test_app_smoke.py` — GUI 構造 / 載入 / 搜尋 / 高亮
+- `tests/test_storage.py` — CRUD、2560 byte 限制、lock 衝突、損壞 index 還原、`group_colors` 持久化與驗證
+- `tests/test_native_host.py` — stdin/stdout 模擬,所有訊息類型 + 錯誤路徑、`get_group_colors` / `set_group_color` handler
+- `tests/test_app_smoke.py` — GUI 構造 / 載入 / 搜尋 / 高亮 / 群組選色對話框
+- `tests/test_extension_manifest.py` — manifest 完整性、`popup.js` 必要 token(含 group_colors 覆寫相關)
 
 ### 手動 smoke test
 
@@ -354,12 +357,14 @@ pytest tests/ -v
 
 | type | request | response |
 |------|---------|----------|
-| `query` | `{type, url, tabId}` | `{ok, matches:[{id,label,username,url}]}` |
+| `query` | `{type, url, tabId}` | `{ok, matches:[{id,label,username,url,launch_url,group}], group_colors:{name:#rrggbb}}` |
 | `fetch` | `{type, id}` | `{ok, entry, password}` |
-| `list` | `{type}` | `{ok, entries:[...]}` |
+| `list` | `{type}` | `{ok, entries:[...], group_colors}` |
 | `save` | `{type, entry, password}` | `{ok, id}` |
 | `delete` | `{type, id}` | `{ok}` |
 | `report_url` | `{type, url, tabId, ts}` | `{ok}` |
 | `ping` | `{type}` | `{ok, pong:true}` |
+| `get_group_colors` | `{type}` | `{ok, group_colors}` |
+| `set_group_color` | `{type, group, color}` | `{ok}`(`color: null` 移除該群組覆寫) |
 
 錯誤碼:`BUSY` / `NOT_FOUND` / `BAD_REQUEST` / `INTERNAL` / `PASSWORD_TOO_LONG` / `NOTES_TOO_LONG`。
