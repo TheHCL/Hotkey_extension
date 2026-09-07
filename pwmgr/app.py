@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import tkinter.ttk as ttk
@@ -301,6 +302,7 @@ class PwmgrApp:
         self.label_var = tk.StringVar()
         self.url_entry_var = tk.StringVar()
         self.username_var = tk.StringVar()
+        self.launch_url_var = tk.StringVar()
         self.notes_text: tk.Text
         self.password_var = tk.StringVar()
         self.show_password_var = tk.BooleanVar(value=False)
@@ -319,7 +321,20 @@ class PwmgrApp:
             entry.grid(row=i, column=1, columnspan=2, sticky=tk.EW, pady=6)
             var.trace_add("write", lambda *_: self._on_form_change())
 
-        pw_row = len(rows) + 1
+        # 啟動網址(可選)——inline 「開啟」按鈕
+        launch_row = len(rows) + 1  # = 4
+        ttk.Label(parent, text="啟動網址", style="CardMuted.TLabel").grid(
+            row=launch_row, column=0, sticky=tk.W, padx=(0, 10), pady=6
+        )
+        launch_entry = ttk.Entry(parent, textvariable=self.launch_url_var)
+        launch_entry.grid(row=launch_row, column=1, sticky=tk.EW, pady=6)
+        self.launch_open_btn = ttk.Button(
+            parent, text="開啟", width=6, command=self._open_launch_url
+        )
+        self.launch_open_btn.grid(row=launch_row, column=2, sticky=tk.E, padx=(8, 0))
+        self.launch_url_var.trace_add("write", lambda *_: self._on_form_change())
+
+        pw_row = launch_row + 1
         ttk.Label(parent, text="密碼", style="CardMuted.TLabel").grid(
             row=pw_row, column=0, sticky=tk.W, padx=(0, 10), pady=6
         )
@@ -414,6 +429,7 @@ class PwmgrApp:
         self.label_var.set(entry.label)
         self.url_entry_var.set(entry.url)
         self.username_var.set(entry.username)
+        self.launch_url_var.set(entry.launch_url)
         self.password_var.set("")  # 不在記憶體中保留
         self.notes_text.delete("1.0", tk.END)
         self.notes_text.insert("1.0", entry.notes)
@@ -455,6 +471,7 @@ class PwmgrApp:
         self.label_var.set("")
         self.url_entry_var.set(self._suggested_url())
         self.username_var.set("")
+        self.launch_url_var.set(self._current_url or "")
         self.password_var.set("")
         self.notes_text.delete("1.0", tk.END)
         self.notes_text.edit_modified(False)
@@ -478,12 +495,24 @@ class PwmgrApp:
         label = self.label_var.get().strip()
         url = self.url_entry_var.get().strip()
         username = self.username_var.get().strip()
+        launch_url = self.launch_url_var.get().strip()
         password = self.password_var.get()
         notes = self.notes_text.get("1.0", tk.END).rstrip("\n")
 
         if not label or not url or not username:
             messagebox.showwarning("欄位不完整", "「名稱」、「網域」、「帳號」皆不可空白。")
             return
+        if launch_url:
+            try:
+                scheme = urlparse(launch_url).scheme
+            except ValueError:
+                scheme = ""
+            if scheme not in ("http", "https"):
+                messagebox.showwarning(
+                    "網址格式錯誤",
+                    "「啟動網址」若填寫,必須是 http(s) 開頭的完整網址。",
+                )
+                return
         if not password and not self._selected_id:
             messagebox.showwarning("缺少密碼", "新條目必須設定密碼。")
             return
@@ -492,13 +521,14 @@ class PwmgrApp:
             if self._selected_id:
                 entry = next((e for e in self._entries if e.id == self._selected_id), None)
                 if entry is None:
-                    entry = PasswordEntry.new(label, url, username, notes)
+                    entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url)
                     storage.save_entry(entry, password)
                 else:
                     entry.label = label
                     entry.url = url
                     entry.username = username
                     entry.notes = notes
+                    entry.launch_url = launch_url
                     if password:
                         storage.save_entry(entry, password)
                     else:
@@ -507,7 +537,7 @@ class PwmgrApp:
                         # 否則會把 keyring 裡原本的密碼覆蓋成空字串。
                         storage.update_entry(entry)
             else:
-                entry = PasswordEntry.new(label, url, username, notes)
+                entry = PasswordEntry.new(label, url, username, notes, launch_url=launch_url)
                 storage.save_entry(entry, password)
         except storage.PasswordTooLongError as e:
             messagebox.showerror("密碼過長", str(e))
@@ -612,6 +642,28 @@ class PwmgrApp:
             return
         self._copy_to_clipboard(pwd)
         self._set_status(f"已複製密碼(將於 {CLIPBOARD_CLEAR_SECONDS} 秒後自動清空)")
+
+    def _open_launch_url(self) -> None:
+        """以系統預設瀏覽器開啟『啟動網址』欄位的內容。"""
+        url = self.launch_url_var.get().strip()
+        if not url:
+            messagebox.showinfo("無啟動網址", "尚未填寫啟動網址。")
+            return
+        try:
+            scheme = urlparse(url).scheme
+        except ValueError:
+            scheme = ""
+        if scheme not in ("http", "https"):
+            messagebox.showwarning(
+                "不支援的通訊協定",
+                f"目前只支援 http(s),實際為:{scheme or '(無)'}",
+            )
+            return
+        try:
+            webbrowser.open(url)
+            self._set_status(f"已在瀏覽器開啟:{url}")
+        except Exception as e:
+            messagebox.showerror("開啟失敗", f"{type(e).__name__}: {e}")
 
     # --- 剪貼簿 --------------------------------------------------------------
 

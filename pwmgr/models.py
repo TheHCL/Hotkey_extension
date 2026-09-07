@@ -17,13 +17,20 @@ class PasswordEntry:
     url: str  # 註冊網域,例如 "github.com"
     username: str
     notes: str = ""
+    launch_url: str = ""  # 一鍵開啟的完整網址(例如 "https://github.com/login");不影響 matching
     created_at: float = 0.0
     updated_at: float = 0.0
 
     # --- 工廠方法 -----------------------------------------------------------
 
     @staticmethod
-    def new(label: str, url: str, username: str, notes: str = "") -> "PasswordEntry":
+    def new(
+        label: str,
+        url: str,
+        username: str,
+        notes: str = "",
+        launch_url: str = "",
+    ) -> "PasswordEntry":
         now = time.time()
         return PasswordEntry(
             id=uuid.uuid4().hex,
@@ -31,6 +38,7 @@ class PasswordEntry:
             url=url,
             username=username,
             notes=notes,
+            launch_url=launch_url,
             created_at=now,
             updated_at=now,
         )
@@ -49,6 +57,7 @@ class PasswordEntry:
             url=data.get("url", ""),
             username=data.get("username", ""),
             notes=data.get("notes", ""),
+            launch_url=data.get("launch_url", ""),
             created_at=data.get("created_at", 0.0),
             updated_at=data.get("updated_at", 0.0),
         )

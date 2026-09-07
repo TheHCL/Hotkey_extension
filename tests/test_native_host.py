@@ -238,3 +238,62 @@ def test_oversized_password(isolated, fake_keyring) -> None:
     }))
     r = _read_message(io.BytesIO(out))
     assert r["code"] == "PASSWORD_TOO_LONG"
+
+
+# --- launch_url 欄位 --------------------------------------------------------
+
+
+def test_native_save_includes_launch_url(isolated, fake_keyring) -> None:
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {
+            "label": "GH",
+            "url": "github.com",
+            "username": "alice",
+            "launch_url": "https://github.com/login",
+        },
+        "password": "p",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(msgs)))["id"]
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["ok"] is True
+    assert r["entry"]["launch_url"] == "https://github.com/login"
+
+
+def test_native_save_without_launch_url_defaults_empty(isolated, fake_keyring) -> None:
+    """舊用戶端沒帶 launch_url 時,要容錯(預設空字串)。"""
+    msgs = _encode_message({
+        "type": "save",
+        "entry": {"label": "Other", "url": "x.com", "username": "u"},
+        "password": "p2",
+    })
+    eid = _read_message(io.BytesIO(_drive_loop(msgs)))["id"]
+
+    out = _drive_loop(_encode_message({"type": "fetch", "id": eid}))
+    r = _read_message(io.BytesIO(out))
+    assert r["entry"]["launch_url"] == ""
+
+
+def test_native_query_includes_launch_url(isolated, fake_keyring) -> None:
+    msgs = b"".join([
+        _encode_message({
+            "type": "save",
+            "entry": {
+                "label": "GH",
+                "url": "github.com",
+                "username": "alice",
+                "launch_url": "https://github.com/login",
+            },
+            "password": "p",
+        }),
+        _encode_message({"type": "query", "url": "https://github.com/"}),
+    ])
+    out = _drive_loop(msgs)
+    s = io.BytesIO(out)
+    _read_message(s)  # save 回應,丟棄
+    r = _read_message(s)
+    assert r["ok"] is True
+    assert len(r["matches"]) == 1
+    assert r["matches"][0]["launch_url"] == "https://github.com/login"

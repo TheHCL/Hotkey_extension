@@ -92,7 +92,13 @@ def _handle_query(req: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "matches": [
-            {"id": e.id, "label": e.label, "username": e.username, "url": e.url}
+            {
+                "id": e.id,
+                "label": e.label,
+                "username": e.username,
+                "url": e.url,
+                "launch_url": e.launch_url,
+            }
             for e in matches
         ],
     }
@@ -134,16 +140,17 @@ def _handle_save(req: dict[str, Any]) -> dict[str, Any]:
             entry = storage.get_entry(eid)
         except storage.EntryNotFoundError:
             raise NativeHostError("NOT_FOUND", f"id={eid} 不存在")
-        for k in ("label", "url", "username", "notes"):
+        for k in ("label", "url", "username", "notes", "launch_url"):
             if k in entry_data:
                 setattr(entry, k, entry_data[k])
     else:
-        # 新建——從 entry_data 拿 label/url/username/notes,id 由 PasswordEntry.new 產生
+        # 新建——從 entry_data 拿 label/url/username/notes/launch_url,id 由 PasswordEntry.new 產生
         entry = PasswordEntry.new(
             label=str(entry_data.get("label", "")),
             url=str(entry_data.get("url", "")),
             username=str(entry_data.get("username", "")),
             notes=str(entry_data.get("notes", "")),
+            launch_url=str(entry_data.get("launch_url", "")),
         )
     new_id = storage.save_entry(entry, password)
     return {"ok": True, "id": new_id}

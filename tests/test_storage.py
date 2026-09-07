@@ -210,3 +210,41 @@ def test_corrupted_index_recovers(fake_keyring, tmp_index, null_locks) -> None:
     assert entries == []
     # 備份檔應存在
     assert (tmp_index.with_suffix(".json.bak")).exists()
+
+
+# --- launch_url 欄位 ---------------------------------------------------------
+
+
+def test_save_entry_roundtrips_launch_url(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new(
+        "GitHub",
+        "github.com",
+        "alice",
+        notes="2FA on",
+        launch_url="https://github.com/login",
+    )
+    storage.save_entry(e, "secret")
+
+    loaded = storage.load_index()
+    assert len(loaded) == 1
+    assert loaded[0].launch_url == "https://github.com/login"
+    # to_dict() 也要帶到
+    assert loaded[0].to_dict()["launch_url"] == "https://github.com/login"
+
+    # 舊資料沒有 launch_url 鍵時,from_dict 要能容錯讀成空字串
+    raw = json.loads(tmp_index.read_text())["entries"][0]
+    raw.pop("launch_url", None)
+    assert PasswordEntry.from_dict(raw).launch_url == ""
+
+
+def test_update_entry_preserves_launch_url(fake_keyring, tmp_index, null_locks) -> None:
+    e = PasswordEntry.new(
+        "GH", "github.com", "alice", launch_url="https://github.com/login"
+    )
+    storage.save_entry(e, "secret")
+    # 模擬 GUI 編輯既有條目、密碼欄位留空(走 update_entry 而非 save_entry)
+    e.launch_url = "https://github.com/settings/tokens"
+    storage.update_entry(e)
+
+    reloaded = storage.load_index()[0]
+    assert reloaded.launch_url == "https://github.com/settings/tokens"
