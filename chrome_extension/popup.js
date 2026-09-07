@@ -15,6 +15,28 @@ let currentUrl = null;
 let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
 const NO_GROUP = "__none__"; // 空群組的內部 bucket key(只用於排序,不對外顯示)
 
+// 每個 group 一個固定色票(hash group 名稱決定),label 背景 + 條目左邊界用對應色
+// 淺色背景搭配深一點的 accent,保持文字可讀
+const GROUP_PALETTE = [
+  { bg: "#eaf4ff", accent: "#0078d4" }, // blue
+  { bg: "#e8f7ed", accent: "#2e8b3d" }, // green
+  { bg: "#f1edff", accent: "#6c4dde" }, // purple
+  { bg: "#fff1e6", accent: "#d2691e" }, // orange
+  { bg: "#ffecf1", accent: "#d6336c" }, // pink
+  { bg: "#e6f7f7", accent: "#148080" }, // teal
+  { bg: "#fff8e1", accent: "#b8860b" }, // yellow
+  { bg: "#ffeaea", accent: "#c33"    }, // red
+];
+const NEUTRAL_COLOR = { bg: "#f3f3f3", accent: "#888" }; // 未分類用中性灰
+
+function groupColorIndex(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) {
+    h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h) % GROUP_PALETTE.length;
+}
+
 async function init() {
   // 1. 連線檢查
   const pingResp = await chrome.runtime.sendMessage({ type: "ping" });
@@ -172,6 +194,14 @@ function renderGroupMenu(entries, keyword) {
     li.className = "group-item";
     li.dataset.group = key;
 
+    // 依 group 名稱 hash 決定色票(同名稱永遠同一顏色)
+    const color =
+      key === NO_GROUP
+        ? NEUTRAL_COLOR
+        : GROUP_PALETTE[groupColorIndex(key)];
+    li.style.setProperty("--group-bg", color.bg);
+    li.style.setProperty("--group-accent", color.accent);
+
     const label = document.createElement("div");
     label.className = "group-label";
     const nameSpan = document.createElement("span");
@@ -188,7 +218,7 @@ function renderGroupMenu(entries, keyword) {
     for (const e of items) {
       const entryLi = document.createElement("li");
       entryLi.dataset.id = e.id;
-      entryLi.textContent = `${e.label}  (${e.launch_url || ""})`;
+      entryLi.textContent = e.label;
       entryLi.addEventListener("click", (ev) => {
         ev.stopPropagation();
         launchAndFill(e.launch_url, e.id);

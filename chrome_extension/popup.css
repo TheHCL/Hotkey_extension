@@ -93,7 +93,7 @@ header {
   align-items: center;
   padding: 8px 12px;
   font-weight: 600;
-  background: #f3f8ff;
+  background: var(--group-bg, #f3f8ff);
   user-select: none;
   color: #222;
   font-size: 13px;
@@ -101,7 +101,8 @@ header {
 
 .group-item:hover .group-label,
 .group-item.is-open .group-label {
-  background: #e3efff;
+  /* 用 filter 蓋一層暗影,讓每個 group 的色票在 hover 時都看得出變化 */
+  filter: brightness(0.96);
 }
 
 .group-label .count {
@@ -118,7 +119,7 @@ header {
   background: #fff;
   max-height: 280px;
   overflow-y: auto;
-  border-left: 3px solid #0078d4;
+  border-left: 3px solid var(--group-accent, #0078d4);
 }
 
 .group-item:hover > .entry-list,
