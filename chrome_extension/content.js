@@ -93,13 +93,15 @@
     let filled = 0;
     for (const pwInput of passwordInputs) {
       // 找 username:同一 form 中前一個 text/email/tel/url/search
+      // 注意:要排除 captcha 欄位(looksLikeCaptchaField),免得在「密碼 + captcha」頁面
+      // 把 username 塞進 captcha 輸入框。
       const form = pwInput.closest("form");
       let userInput = null;
       if (form) {
         const candidates = Array.from(form.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="search"], input:not([type])'));
         // 取 password 之前的最後一個
         for (const c of candidates) {
-          if (!isUsable(c) || looksLikePasswordField(c)) continue;
+          if (!isUsable(c) || looksLikePasswordField(c) || looksLikeCaptchaField(c)) continue;
           const idxPw = indexInForm(form, pwInput);
           const idxC = indexInForm(form, c);
           if (idxC >= 0 && idxC < idxPw) {
@@ -115,6 +117,8 @@
       setValue(pwInput, password);
       if (userInput) {
         setValue(userInput, username);
+      } else {
+        console.log("[pwmgr] 找不到 username 欄位(可能此頁只有密碼 + captcha),跳過 username 填入");
       }
       filled++;
     }
@@ -123,7 +127,7 @@
 
   function fillUsernameOnly(username) {
     const allInputs = Array.from(document.querySelectorAll("input"));
-    const usableList = allInputs.filter((el) => isUsable(el) && !looksLikePasswordField(el));
+    const usableList = allInputs.filter((el) => isUsable(el) && !looksLikePasswordField(el) && !looksLikeCaptchaField(el));
     console.log("[pwmgr] fillUsernameOnly candidates", usableList.length, "/ total inputs:", allInputs.length);
     if (allInputs.length > 0 && usableList.length === 0) {
       console.log("[pwmgr] no usable input; all inputs:", allInputs.map(function (el) {
@@ -237,6 +241,27 @@
     return /password|passwd|密碼|密码|パスワード|비밀번호/.test(haystack);
   }
 
+  // 跟 looksLikePasswordField 對稱:用同樣的關鍵字偵測「看起來像 captcha 輸入框」的元素,
+  // fillForm 找 username 候選時要把這些排除,免得密碼 + captcha 頁面被誤把 captcha 欄位
+  // 填成 username。
+  // 關鍵字跟 CAPTCHA_KEYWORDS 對齊,但排除 password 自己的關鍵字避免重疊。
+  function looksLikeCaptchaField(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    if (el.type === "password") return false;
+    if (el.type !== "text" && el.type !== "") return false;
+    const haystack = [
+      el.id,
+      el.name,
+      el.className,
+      el.getAttribute("aria-label") || "",
+      el.placeholder || "",
+      el.autocomplete || "",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return /captcha|verify|verification|code|驗證|驗証|認證|认证|確認碼|確認コード|보안|인증/.test(haystack);
+  }
+
   function isUsable(el) {
     if (!el) return false;
     if (el.disabled || el.readOnly) return false;
@@ -258,7 +283,7 @@
       document.querySelectorAll(
         'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="search"], input:not([type])'
       )
-    ).filter((el) => isUsable(el) && el !== pwInput && !looksLikePasswordField(el));
+    ).filter((el) => isUsable(el) && el !== pwInput && !looksLikePasswordField(el) && !looksLikeCaptchaField(el));
     if (candidates.length === 0) return null;
     const pwRect = pwInput.getBoundingClientRect();
     candidates.sort((a, b) => {
