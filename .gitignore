@@ -13,10 +13,12 @@ htmlcov/
 # Build / dist (PyInstaller)
 build/
 dist/
-*.spec
+# .spec 是 PyInstaller build 時自動產生的,但我們選擇 commit 進去,
+# 方便別人不用 build.py、直接 pyinstaller PWmgr.spec 也能 build
+# (packaging/ 整個目錄同理——build.py 是 source)
 
-# Packaging
-packaging/
+
+# Packaging 整個目錄進版控(裡面的 build.py、entry_gui.py、entry_setup.py、pwmgr.ico 是 source)
 
 # install.py 產物——每台機器路徑/帳號都不同,不進版控
 bin/
