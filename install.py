@@ -59,13 +59,18 @@ def err(msg: str) -> None:
 
 def check_deps() -> bool:
     ok = True
-    for mod in ("keyring", "pystray", "PIL"):
+    for mod in ("keyring", "pystray", "PIL", "ddddocr"):
         try:
             __import__(mod if mod != "PIL" else "PIL.Image")
             info(f"  [OK] {mod}")
         except ImportError:
-            warn(f"  [X] {mod} 未安裝;請執行: pip install -r requirements.txt")
-            ok = False
+            if mod == "ddddocr":
+                # captcha OCR 是 optional,沒裝的話擴充功能照常運作,只是不會解 captcha。
+                warn(f"  [!] {mod} 未安裝(captcha 自動填入會停用);其他功能不受影響。")
+                warn(f"       若要啟用,請: pip install ddddocr")
+            else:
+                warn(f"  [X] {mod} 未安裝;請執行: pip install -r requirements.txt")
+                ok = False
     return ok
 
 
