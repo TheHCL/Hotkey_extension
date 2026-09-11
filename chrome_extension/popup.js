@@ -11,6 +11,13 @@ const $groupList = document.getElementById("group-list");
 const $navigateToggle = document.getElementById("navigate-toggle");
 const $captchaBtn = document.getElementById("captcha-btn");
 
+// captcha 按鈕的 click handler 改在這裡就綁一次,不再放進 async detectCaptchaOnTab
+// 的條件分支內。原因:
+//   - async + if 內 addEventListener 容易在 popup 被 Chrome 提前關閉/重開的時機
+//     漏綁(這就是先前「按鈕可見但 click 不觸發」的根因)
+//   - 顯示/隱藏交給 $captchaBtn.hidden 控制,handler 本身永遠在
+$captchaBtn.addEventListener("click", onCaptchaClick);
+
 let currentTabId = null;
 let currentUrl = null;
 let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
@@ -158,25 +165,25 @@ async function detectCaptchaOnTab() {
   if (!currentTabId) return;
   try {
     const resp = await chrome.tabs.sendMessage(currentTabId, { type: "detectCaptcha" });
-    if (resp && resp.ok && resp.found) {
-      $captchaBtn.hidden = false;
-      $captchaBtn.addEventListener("click", onCaptchaClick);
-    } else {
-      $captchaBtn.hidden = true;
-    }
+    // click handler 已在 script 載入時就綁好,這裡只 toggle 顯示
+    $captchaBtn.hidden = !(resp && resp.ok && resp.found);
+    console.log("[pwmgr][popup] detectCaptcha:", resp);
   } catch (e) {
     // 沒有 content script 注入(非 http(s) 或 SPA 還沒載入)就當沒有
     $captchaBtn.hidden = true;
+    console.log("[pwmgr][popup] detectCaptcha threw:", e && e.message || e);
   }
 }
 
 async function onCaptchaClick() {
+  console.log("[pwmgr][popup] onCaptchaClick start, currentTabId=", currentTabId);
   $captchaBtn.disabled = true;
   const orig = $captchaBtn.textContent;
   $captchaBtn.textContent = "解碼中…";
   setStatus("送出 captcha 圖給 native host 解碼…");
   try {
     const resp = await chrome.tabs.sendMessage(currentTabId, { type: "solveCaptcha" });
+    console.log("[pwmgr][popup] solveCaptcha resp:", resp);
     if (resp && resp.ok) {
       setStatus(`已填入:${resp.text} (${resp.confidence === "high" ? "高信心" : "低信心"})`);
     } else if (resp && resp.code === "LOW_CONFIDENCE") {
@@ -191,6 +198,7 @@ async function onCaptchaClick() {
       setStatus(`失敗:${(resp && (resp.code || resp.error)) || "unknown"}`);
     }
   } catch (e) {
+    console.warn("[pwmgr][popup] onCaptchaClick threw:", e);
     setStatus(`例外:${(e && e.message) || e}`);
   } finally {
     $captchaBtn.disabled = false;
