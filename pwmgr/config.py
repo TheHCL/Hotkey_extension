@@ -79,18 +79,32 @@ HOTKEY_ID = 1
 
 
 def python_executable() -> str:
-    """回傳目前直譯器的絕對路徑(GUI 走 python.exe,native host 走 pythonw.exe)。
+    """回傳 PWmgr(GUI + native host)exe 的絕對路徑。
 
-    打包後(frozen):直接回傳 PWmgr.exe 的路徑(GUI 與 native host 是同一個 exe,
-    用 --native 分流,見 pwmgr/__main__.py)。
+    開發模式:目前直譯器(`python.exe`)。
+    打包後(frozen):
+      - 若目前執行的是 `PWmgr.exe` 本體(GUI 與 native host 共用,見
+        `pwmgr/__main__.py` 的 `--native` 分流),回傳自己。
+      - 若目前執行的是 `PWmgrSetup.exe`(安裝器),回傳同層 `PWmgr\\` 資料夾
+        裡的 `PWmgr.exe`。PWmgr 是 onedir,exe 在子目錄,不是直接放在
+        `dist\\` 根目錄。
+        ⚠ 此處 `PWmgr` 子目錄名必須與 `packaging\\build.py` 的 `--name PWmgr`
+        保持一致;改名後要同步。
     """
     if getattr(sys, "frozen", False):
-        return str(PROJECT_ROOT / "PWmgr.exe")
+        exe = Path(sys.executable).resolve()
+        if exe.name == "PWmgr.exe":
+            return str(exe)
+        # PWmgrSetup.exe → 同層 PWmgr\ 資料夾裡的 PWmgr.exe
+        return str(exe.parent / "PWmgr" / "PWmgr.exe")
     return sys.executable
 
 
 def pythonw_executable() -> str:
-    """尋找 pythonw.exe,優先在同一目錄。frozen 時同 python_executable()。"""
+    """frozen 時同 python_executable()(PWmgr.exe 同時充當 GUI 與 native host,無 console)。
+
+    開發模式:優先找同目錄的 `pythonw.exe`,否則 fallback 到 `python.exe`。
+    """
     if getattr(sys, "frozen", False):
         return python_executable()
     py = Path(sys.executable)

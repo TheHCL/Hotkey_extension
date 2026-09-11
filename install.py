@@ -254,7 +254,10 @@ def main() -> int:
         info("  • 拿到 Extension ID 後,重跑 python install.py 完成登錄註冊。")
     info("  • 啟動 GUI:在工作列右下角找到 PWmgr 圖示,")
     info("    或從開始功能表執行「PWmgr」,或直接:")
-    info(f"      {pythonw_executable()} -m pwmgr")
+    if getattr(sys, "frozen", False):
+        info(f"      {pythonw_executable()}")
+    else:
+        info(f"      {pythonw_executable()} -m pwmgr")
     info("  • 按 Ctrl+Shift+L 顯示 / 隱藏主視窗。")
     info("=" * 60)
     return 0
