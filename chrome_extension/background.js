@@ -265,6 +265,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === "solveCaptcha") {
+    // content script 抓到 captcha 圖(已是 dataURL)或 URL,forward 給 native host 跑 OCR
+    (async () => {
+      const payload = {};
+      if (typeof msg.image === "string" && msg.image.startsWith("data:")) {
+        payload.image = msg.image;
+      } else if (typeof msg.imageUrl === "string") {
+        payload.image_url = msg.imageUrl;
+      } else {
+        sendResponse({ ok: false, code: "BAD_REQUEST", error: "缺少 image 或 imageUrl" });
+        return;
+      }
+      const resp = await sendNative({ type: "solve_captcha", ...payload });
+      sendResponse(resp);
+    })();
+    return true;
+  }
+
   if (msg.type === "openLaunch") {
     (async () => {
       const url = String(msg.url || "");

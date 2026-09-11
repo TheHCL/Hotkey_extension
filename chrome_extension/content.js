@@ -1,8 +1,10 @@
-// content.js — 自動填入 username / password
+// content.js — 自動填入 username / password,以及 captcha
 // 規則:
 //   1. 找頁面上所有 input[type=password] (限可見、未被 disabled)
 //   2. 每個 password 往上找同一 <form> 中前一個 text/email/tel input 作為 username
 //   3. 設值後派發 input + change 事件(React/Vue 受控元件才會更新 state)
+//   4. captcha 偵測:由 popup 觸發,找頁面上疑似 captcha 的 <img> 與對應 input,
+//      把圖轉 dataURL 送 native host 跑 OCR,結果填回 input(失敗就甚麼都不做)
 
 (function () {
   "use strict";
@@ -252,4 +254,245 @@
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
+
+  // ===== Captcha 偵測 + 解碼 =================================================
+  //
+  // 觸發:popup 傳 solveCaptcha 訊息 -> content script 找頁面上的 captcha 圖,
+  //       轉 dataURL 送 background -> native host 跑 OCR -> 填回對應 input
+  //
+  // 設計保守:找不到就回 ok=false,絕不亂填。
+
+  // 「可能是 captcha 圖」的關鍵字——涵蓋中英日韓常見用詞
+  const CAPTCHA_KEYWORDS = /(captcha|verify|verification|code|驗證|驗証|認證|认证|確認碼|確認コード|보안|인증)/i;
+
+  function isLikelyCaptchaImg(img) {
+    if (!img || img.tagName !== "IMG") return false;
+    if (!img.src) return false;
+    // 排除 data:image/svg+xml (常是 icon)
+    if (img.src.startsWith("data:image/svg")) return false;
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    // 過濾:大圖(> 500px 寬)通常不是 captcha;太小(< 30px)也跳過
+    if (rect.width < 30 || rect.width > 500) return false;
+    if (rect.height < 15 || rect.height > 150) return false;
+    // 屬性命中關鍵字
+    const haystack = [
+      img.src,
+      img.id || "",
+      img.name || "",
+      img.alt || "",
+      img.className || "",
+      img.getAttribute("aria-label") || "",
+      img.getAttribute("title") || "",
+    ].join(" ");
+    if (CAPTCHA_KEYWORDS.test(haystack)) return true;
+    // 寬高比:傳統 captcha 寬:高 約 3:1 ~ 6:1,且寬 < 300
+    const ratio = rect.width / rect.height;
+    if (ratio >= 2 && ratio <= 7 && rect.width <= 300 && rect.height <= 80) {
+      // 額外要求:同一 form/parent 內有可疑空 input(下一段 findAssociatedInput 會檢查)
+      // 這裡先放寬,讓 findAssociatedInput 決定要不要採信
+      return true;
+    }
+    return false;
+  }
+
+  // 找與 captcha 圖相關聯的 text input
+  // 規則優先序:
+  //   1. 同 form 內、緊接在 img 後面 的第一個可見空 input
+  //   2. 視覺上相鄰(垂直 y 座標差距 < 30px)的 input
+  //   3. input 的 name/id/placeholder 含 captcha/verify/code 關鍵字
+  function findAssociatedInput(img) {
+    const allInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'))
+      .filter((el) => isUsable(el) && !looksLikePasswordField(el));
+    if (allInputs.length === 0) return null;
+
+    const imgRect = img.getBoundingClientRect();
+
+    // 1. 同 form
+    const form = img.closest("form");
+    if (form) {
+      const formInputs = allInputs.filter((el) => el.closest("form") === form);
+      const imgInForm = Array.from(form.querySelectorAll("img")).indexOf(img);
+      let best = null;
+      let bestDist = Infinity;
+      for (const inp of formInputs) {
+        // 用 DOM 順序距離當啟發式
+        const inFormInputs = Array.from(form.querySelectorAll("input,img"));
+        const inpIdx = inFormInputs.indexOf(inp);
+        const dist = Math.abs(inpIdx - imgInForm);
+        if (dist > 0 && dist < bestDist) {
+          best = inp;
+          bestDist = dist;
+        }
+      }
+      if (best) return best;
+    }
+
+    // 2. 視覺相鄰
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const inp of allInputs) {
+      const r = inp.getBoundingClientRect();
+      const dy = Math.abs((r.top + r.height / 2) - (imgRect.top + imgRect.height / 2));
+      const dx = Math.abs(r.left - imgRect.right);
+      // 同一水平帶、且在 img 右邊(或上下重疊)
+      const dist = dy + Math.min(dx, 1000);
+      if (dy < 40 && dx < 300 && dist < nearestDist) {
+        nearest = inp;
+        nearestDist = dist;
+      }
+    }
+    if (nearest) return nearest;
+
+    // 3. 關鍵字
+    const kwMatch = allInputs.find((inp) => {
+      const h = (inp.name + " " + inp.id + " " + (inp.placeholder || "") + " " + (inp.getAttribute("aria-label") || "")).toLowerCase();
+      return CAPTCHA_KEYWORDS.test(h);
+    });
+    return kwMatch || null;
+  }
+
+  // 把 img 轉成 dataURL(用 canvas)。同源圖可;跨源若沒 CORS header 會 taint canvas,
+  // 此時 try/catch 改送原始 URL 給 background(用 fetch 帶 cookie 抓,某些網站需要)
+  function imgToDataUrl(img) {
+    return new Promise((resolve, reject) => {
+      try {
+        const canvas = document.createElement("canvas");
+        // 用 naturalWidth/Height 確保拿到原始解析度
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("canvas context 建立失敗"));
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        const url = canvas.toDataURL("image/png");
+        resolve(url);
+      } catch (e) {
+        // 通常是 cross-origin taint,退回用 URL
+        reject(e);
+      }
+    });
+  }
+
+  // 預載圖片(若是 lazy-loaded:<img loading="lazy">)以確保 naturalWidth/Height 有值
+  function preloadImg(img) {
+    return new Promise((resolve) => {
+      if (img.complete && img.naturalWidth > 0) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        img.removeEventListener("load", done);
+        img.removeEventListener("error", done);
+        resolve();
+      };
+      img.addEventListener("load", done);
+      img.addEventListener("error", done);
+      // 強制觸發載入(若 src 是空的或 data URL,這個無效但也不會壞)
+      if (!img.src) {
+        resolve();
+      } else {
+        // 重新指 src 觸發 reload
+        const src = img.src;
+        img.src = "";
+        img.src = src;
+      }
+      // 5 秒 timeout
+      setTimeout(done, 5000);
+    });
+  }
+
+  // 對頁面所有「可能是 captcha」的 img 評分,取最高分
+  function findBestCaptchaCandidate() {
+    const imgs = Array.from(document.querySelectorAll("img")).filter(isLikelyCaptchaImg);
+    if (imgs.length === 0) return null;
+    // 評分:命中關鍵字 > 緊鄰 input > 寬高比
+    const scored = imgs.map((img) => {
+      let score = 0;
+      const haystack = (img.src + " " + (img.id || "") + " " + (img.name || "") + " " + (img.alt || "") + " " + (img.className || "")).toLowerCase();
+      if (CAPTCHA_KEYWORDS.test(haystack)) score += 10;
+      const rect = img.getBoundingClientRect();
+      const ratio = rect.width / rect.height;
+      if (ratio >= 2.5 && ratio <= 5) score += 3;
+      // 找得到關聯 input 加分
+      if (findAssociatedInput(img)) score += 5;
+      return { img, score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].img;
+  }
+
+  // solveCaptcha 主流程(被 background 觸發)
+  async function solveCaptcha() {
+    const img = findBestCaptchaCandidate();
+    if (!img) {
+      return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 captcha 圖" };
+    }
+    const input = findAssociatedInput(img);
+    if (!input) {
+      return { ok: false, code: "NO_INPUT", error: "找不到對應的輸入框" };
+    }
+    // 預載 + 轉 dataURL
+    await preloadImg(img);
+    let dataUrl;
+    try {
+      dataUrl = await imgToDataUrl(img);
+    } catch (e) {
+      // 跨源 taint:退回用 URL 讓 native host 抓
+      console.warn("[pwmgr] canvas taint, falling back to URL fetch:", e);
+      const resp = await chrome.runtime.sendMessage({
+        type: "solveCaptcha",
+        imageUrl: img.src,
+      });
+      return await fillCaptchaResponse(input, resp);
+    }
+    const resp = await chrome.runtime.sendMessage({
+      type: "solveCaptcha",
+      image: dataUrl,
+    });
+    return await fillCaptchaResponse(input, resp);
+  }
+
+  function fillCaptchaResponse(input, resp) {
+    if (resp && resp.ok && resp.text) {
+      setValue(input, resp.text);
+      console.log("[pwmgr] captcha filled:", resp.text, "confidence:", resp.confidence);
+      return { ok: true, text: resp.text, confidence: resp.confidence };
+    }
+    if (resp && resp.code === "LOW_CONFIDENCE") {
+      console.log("[pwmgr] captcha low confidence (std:", resp.std, "beta:", resp.beta, ")—not filling");
+      return { ok: false, code: "LOW_CONFIDENCE", std: resp.std, beta: resp.beta };
+    }
+    if (resp && resp.code === "OCR_UNAVAILABLE") {
+      console.warn("[pwmgr] ddddocr 未安裝");
+      return { ok: false, code: "OCR_UNAVAILABLE", error: resp.error };
+    }
+    console.warn("[pwmgr] captcha solve failed:", resp);
+    return { ok: false, code: (resp && resp.code) || "UNKNOWN", error: (resp && resp.error) || "unknown" };
+  }
+
+  // 註冊來自 background 的 solveCaptcha 訊息
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || msg.type !== "solveCaptcha") return false;
+    solveCaptcha().then(sendResponse).catch((e) => {
+      console.warn("[pwmgr] solveCaptcha threw:", e);
+      sendResponse({ ok: false, code: "EXCEPTION", error: String(e) });
+    });
+    return true; // 保持 sendResponse 開啟(async)
+  });
+
+  // 讓 popup 可以詢問「目前頁面有沒有 captcha」來決定要不要顯示按鈕
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || msg.type !== "detectCaptcha") return false;
+    const img = findBestCaptchaCandidate();
+    if (!img) {
+      sendResponse({ ok: true, found: false });
+      return false;
+    }
+    const input = findAssociatedInput(img);
+    sendResponse({ ok: true, found: !!input, hasImg: true });
+    return false;
+  });
 })();

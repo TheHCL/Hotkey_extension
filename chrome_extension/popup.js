@@ -9,6 +9,7 @@ const $launchSearch = document.getElementById("launch-search");
 const $groupMenu = document.getElementById("group-menu");
 const $groupList = document.getElementById("group-list");
 const $navigateToggle = document.getElementById("navigate-toggle");
+const $captchaBtn = document.getElementById("captcha-btn");
 
 let currentTabId = null;
 let currentUrl = null;
@@ -148,6 +149,53 @@ async function init() {
   // Cascading 群組選單:fallback 模式用,hover 展開該群組條目
   $groupMenu.hidden = false;
   renderLaunchList();
+
+  // 7. captcha 按鈕:目前頁面有偵測到 captcha 才顯示
+  detectCaptchaOnTab();
+}
+
+async function detectCaptchaOnTab() {
+  if (!currentTabId) return;
+  try {
+    const resp = await chrome.tabs.sendMessage(currentTabId, { type: "detectCaptcha" });
+    if (resp && resp.ok && resp.found) {
+      $captchaBtn.hidden = false;
+      $captchaBtn.addEventListener("click", onCaptchaClick);
+    } else {
+      $captchaBtn.hidden = true;
+    }
+  } catch (e) {
+    // 沒有 content script 注入(非 http(s) 或 SPA 還沒載入)就當沒有
+    $captchaBtn.hidden = true;
+  }
+}
+
+async function onCaptchaClick() {
+  $captchaBtn.disabled = true;
+  const orig = $captchaBtn.textContent;
+  $captchaBtn.textContent = "解碼中…";
+  setStatus("送出 captcha 圖給 native host 解碼…");
+  try {
+    const resp = await chrome.tabs.sendMessage(currentTabId, { type: "solveCaptcha" });
+    if (resp && resp.ok) {
+      setStatus(`已填入:${resp.text} (${resp.confidence === "high" ? "高信心" : "低信心"})`);
+    } else if (resp && resp.code === "LOW_CONFIDENCE") {
+      setStatus(`無法辨識(std:${resp.std || "?"} / beta:${resp.beta || "?"}),請手動輸入`);
+    } else if (resp && resp.code === "OCR_UNAVAILABLE") {
+      setStatus(`ddddocr 未安裝,請 pip install ddddocr`);
+    } else if (resp && resp.code === "NOT_FOUND") {
+      setStatus("找不到 captcha 圖,重新整理頁面後再試");
+    } else if (resp && resp.code === "NO_INPUT") {
+      setStatus("找到 captcha 圖但找不到對應的輸入框");
+    } else {
+      setStatus(`失敗:${(resp && (resp.code || resp.error)) || "unknown"}`);
+    }
+  } catch (e) {
+    setStatus(`例外:${(e && e.message) || e}`);
+  } finally {
+    $captchaBtn.disabled = false;
+    $captchaBtn.textContent = orig;
+  }
 }
 
 function renderAutofillList(matches) {
