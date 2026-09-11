@@ -343,8 +343,15 @@ async function fill(id, li) {
   });
   li.style.opacity = "1";
   if (resp && resp.ok) {
-    setStatus("已填入;20 秒後自動清空剪貼簿(GUI 端)");
-    setTimeout(() => window.close(), 1500);
+    // 若頁面有偵測到 captcha,多等 1.5s 讓 content script 完成自動解碼再看結果
+    const hasCaptcha = !$captchaBtn.hidden;
+    if (hasCaptcha) {
+      setStatus("已填入;正在自動解 captcha…");
+      setTimeout(() => window.close(), 2800);
+    } else {
+      setStatus("已填入;20 秒後自動清空剪貼簿(GUI 端)");
+      setTimeout(() => window.close(), 1500);
+    }
   } else if (resp && resp.code === "BUSY") {
     setStatus("密碼管理員忙碌中,稍後再試");
   } else {
