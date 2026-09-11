@@ -22,6 +22,21 @@
       } finally {
         window.__pwmgr_filling__ = false;
       }
+      // 自動接 captcha(若有)。延遲 500ms 讓頁面把 captcha 圖/輸入框 render 出來再嘗試。
+      // solveCaptcha 找不到會回 ok:false 自行處理,這裡 fire-and-forget。
+      if (msg.auto_captcha !== false) {
+        setTimeout(() => {
+          solveCaptcha().then((r) => {
+            if (r && r.ok) {
+              console.log("[pwmgr] auto captcha filled:", r.text);
+            } else if (r && r.code) {
+              console.log("[pwmgr] auto captcha skipped:", r.code);
+            }
+          }).catch((e) => {
+            console.warn("[pwmgr] auto captcha threw:", e);
+          });
+        }, 500);
+      }
     }
   });
 
@@ -41,6 +56,18 @@
         } finally {
           window.__pwmgr_filling__ = false;
         }
+        // claimPendingFill 也代表「launchAndFill 開新分頁的自動流程」,同樣串 captcha
+        setTimeout(() => {
+          solveCaptcha().then((r) => {
+            if (r && r.ok) {
+              console.log("[pwmgr] auto captcha filled:", r.text);
+            } else if (r && r.code) {
+              console.log("[pwmgr] auto captcha skipped:", r.code);
+            }
+          }).catch((e) => {
+            console.warn("[pwmgr] auto captcha threw:", e);
+          });
+        }, 500);
       }
     });
   }, 200);
