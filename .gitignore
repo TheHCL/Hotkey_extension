@@ -13,6 +13,8 @@ htmlcov/
 # Build / dist (PyInstaller)
 build/
 dist/
+# PyInstaller 建置時的 stdout/stderr 紀錄,每台機器時間/路徑都不同
+build_log.txt
 # .spec 是 PyInstaller build 時自動產生的,但我們選擇 commit 進去,
 # 方便別人不用 build.py、直接 pyinstaller PWmgr.spec 也能 build
 # (packaging/ 整個目錄同理——build.py 是 source)

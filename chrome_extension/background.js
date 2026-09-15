@@ -36,10 +36,60 @@ async function fillFnExecutedScript(username, password) {
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   };
-  for (let i = 0; i < 16; i++) {
+
+  // --- Landing page auto-click -------------------------------------------------
+  // 某些 Dell 內網站 (testvault / boss) 首頁是 landing page,只有一顆 "Login" 按鈕,
+  // 點下去才會跳 SSO/auth 頁,密碼欄位才會出現。
+  // 為這些 host 自動 click Login,後續 retry 等密碼欄位出現再填。
+  //
+  // 安全考量:fillFn 只從 scheduleExecuteScriptFill / onUpdated listener 呼叫,
+  // 兩個入口都被 launchFillTabs gate (background.js 內 isLaunchFillTab 檢查),
+  // 所以只有 user 從 PWmgr GUI 啟動的 tab 會被自動點,手動逛網站不會誤觸。
+  const LOGIN_LANDING_HOSTS = new Set(["testvault.dell.com", "boss.dell.com"]);
+  // 嚴格字串匹配,排除 "Continue"、"Login with Google"、"Login to your account" 等
+  const LOGIN_KEYWORDS = /^(log\s*in|login|sign\s*in|signin|登入|登入系統|會員登入)$/i;
+  // 排除區塊:cookie modal、cookie banner、footer (避免點到 Close / cookie policy 連結)
+  const EXCLUDE_SELECTOR = '[id*="cookie" i], [class*="cookie" i], [class*="modal-footer" i], footer';
+  const isLandingHost = LOGIN_LANDING_HOSTS.has(location.hostname.toLowerCase());
+
+  // 找 landing page 上的 "Login" 鈕並 click。
+  // 嚴格條件避免誤觸 cookie modal 等非主要 UI。
+  // 回傳 { ok: true, text } 或 { ok: false }
+  const tryClickLandingLogin = () => {
+    const candidates = Array.from(
+      document.querySelectorAll('button, a[href], input[type="button"], input[type="submit"]')
+    ).filter((el) => isUsable(el) && !el.closest(EXCLUDE_SELECTOR));
+    for (const el of candidates) {
+      const text = (el.textContent || el.value || el.getAttribute("aria-label") || "").trim();
+      if (LOGIN_KEYWORDS.test(text)) {
+        try {
+          el.click();
+          return { ok: true, text: text };
+        } catch (e) {
+          return { ok: false, error: String(e) };
+        }
+      }
+    }
+    return { ok: false };
+  };
+
+  // 至多 30 輪 (15 秒) 等密碼欄位出現。涵蓋 SSO redirect 後 SPA 殼 render 時間。
+  for (let i = 0; i < 30; i++) {
     const inputs = Array.from(document.querySelectorAll("input")).filter(isUsable);
     const pw = inputs.find((el) => el.type === "password");
     if (!pw) {
+      // 沒有密碼欄位時:若是 landing host → 嘗試點 Login 按鈕導去 SSO。
+      // Idempotent flag: 已點過就不再點,避免 click 後未 navigation 又再次點擊造成迴圈。
+      if (isLandingHost && !window.__pwmgr_es_login_clicked__) {
+        const r = tryClickLandingLogin();
+        if (r.ok) {
+          window.__pwmgr_es_login_clicked__ = true;
+          console.log("[pwmgr] landing: 已點擊 Login 按鈕:", JSON.stringify(r.text));
+          // 點完給 navigation 800ms,下一輪再找 password
+          await wait(800);
+          continue;
+        }
+      }
       await wait(500);
       continue;
     }
@@ -90,10 +140,12 @@ async function fillFnExecutedScript(username, password) {
 // 每次 setTimeout 從 storage.local 讀最新 credentials(跨 SW 重啟一致)。
 
 function scheduleExecuteScriptFill(tabId, username, password) {
-  // 排程 15 次,間隔 2 秒,涵蓋 30 秒(Dell SSO SPA 載入 + 兩步驟 navigation)
+  // 排程 20 次,間隔 2 秒,涵蓋 ~40 秒
+  // (Dell SSO SPA 載入 + 兩步驟 navigation,加上 landing page auto-click (testvault/boss)
+  // 點 Login 後跳 SSO/MFA 的時間)
   const intervals = [];
-  for (let i = 0; i < 15; i++) {
-    intervals.push(1000 + i * 2000); // 1s, 3s, 5s, ..., 29s
+  for (let i = 0; i < 20; i++) {
+    intervals.push(1000 + i * 2000); // 1s, 3s, 5s, ..., 39s
   }
   intervals.forEach((delay) => {
     setTimeout(() => {
@@ -120,13 +172,13 @@ function scheduleExecuteScriptFill(tabId, username, password) {
         });
     }, delay);
   });
-  // 30 秒後清掉 launchFillTabs(避免後續 schedule 繼續填)
+  // 42 秒後清掉 launchFillTabs(避免後續 schedule 繼續填)
   setTimeout(() => {
     removeLaunchFillTab(tabId);
     clearPendingFill(tabId);
     console.log("[pwmgr] scheduleExecuteScriptFill timeout for tab", tabId);
-  }, 31000);
-  console.log("[pwmgr] scheduleExecuteScriptFill armed for tab", tabId, "15 attempts over 30s");
+  }, 42000);
+  console.log("[pwmgr] scheduleExecuteScriptFill armed for tab", tabId, "20 attempts over ~40s");
 }
 
 // --- 原生主機連線管理 -------------------------------------------------------
