@@ -9,6 +9,8 @@
 (function () {
   "use strict";
 
+  console.log("[pwmgr] CONTENT SCRIPT INJECTED at", Date.now(), "url=", location.href);
+
   if (window.__pwmgr_filling__) return; // 防止重複
   window.__pwmgr_filling__ = true;
 
@@ -40,47 +42,162 @@
     }
   });
 
-  // 啟動後主動問 background 有沒有 pending fill(解決 MV3 sendMessage 與
-  // content script listener attach 之間的 race condition)
-  setTimeout(function () {
-    // 從 window 或 message sender 拿 tabId(content script 沒有直接的 tabId API,
-    // 改由 background 從 sender.tab.id 推斷;若 sender 沒給,我們仍送但不帶 tabId,
-    // background 會從 storage 比對)
-    chrome.runtime.sendMessage({ type: "claimPendingFill" }, function (resp) {
-      if (resp && resp.ok && resp.username != null) {
-        console.log("[pwmgr] content claimed pending fill");
-        try {
-          fillForm(resp.username || "", resp.password || "");
-        } catch (e) {
-          console.warn("[pwmgr] claim fill error:", e);
-        } finally {
-          window.__pwmgr_filling__ = false;
-        }
-        // claimPendingFill 也代表「launchAndFill 開新分頁的自動流程」,同樣串 captcha
-        setTimeout(() => {
-          solveCaptcha().then((r) => {
-            if (r && r.ok) {
-              console.log("[pwmgr] auto captcha filled:", r.text);
-            } else if (r && r.code) {
-              console.log("[pwmgr] auto captcha skipped:", r.code);
-            }
-          }).catch((e) => {
-            console.warn("[pwmgr] auto captcha threw:", e);
-          });
-        }, 500);
+  // Watcher 模式:content script 偵測到 password input 出現,就主動跟 background
+  // 要 fill credentials。完全繞過 background push 的 race condition(background
+  // 在 status=complete 送 fill,但 listener 還沒 attach 訊號會掉)。
+  //
+  // 行為:
+  //   - 一啟動就開始觀察 DOM
+  //   - 第一次偵測到可見的 password input → 跟 background 要 launchAndFill 留下的
+  //     pendingFill(如果有),或 query + fetch 自動配對(看 background handler 決定)
+  //   - 拿到 fill → 跑 fillForm
+  //
+  // 為何不用 polling 問 background「有沒有 pendingFill」:因為即使有,也要等
+  // page render 完才能 fill,而 page render 完的訊號就是 password input 出現,
+  // 直接觀察 DOM 更直覺。Polling 在 9.5 秒 SPA 殼期間其實是空轉。
+  (function watchForPasswordAndClaim() {
+    let done = false;
+    const maxWaitMs = 60000; // 最多等 60 秒
+    const startTs = Date.now();
+    const tryClaim = () => {
+      if (done) return;
+      if (Date.now() - startTs > maxWaitMs) {
+        done = true;
+        cleanup();
+        console.log("[pwmgr] watch timeout, no login input appeared within 60s");
+        return;
       }
-    });
-  }, 200);
+      // 偵測「看起來像登入表單」:有可見的 email/username input 或 password input。
+      // Dell SWBM 兩步驟 SSO 第一步只有 email,沒有 password — 也要觸發,
+      // 否則 push race 時整個流程卡死。
+      const loginish = isLoginFormLikely();
+      if (!loginish) return;
+      done = true;
+      cleanup();
+      console.log("[pwmgr] 偵測到登入表單,主動跟 background 要 fill, url=", location.href);
+      chrome.runtime.sendMessage({ type: "requestFill", url: location.href }, function (resp) {
+        if (chrome.runtime.lastError) {
+          console.warn("[pwmgr] requestFill runtime error:", chrome.runtime.lastError.message);
+          return;
+        }
+        if (resp && resp.ok && resp.username != null) {
+          console.log("[pwmgr] 從 background 拿到 fill, 開始填入");
+          try {
+            fillForm(resp.username || "", resp.password || "");
+          } catch (e) {
+            console.warn("[pwmgr] fill error:", e);
+          } finally {
+            window.__pwmgr_filling__ = false;
+          }
+          // 串 captcha
+          setTimeout(() => {
+            solveCaptcha().then((r) => {
+              if (r && r.ok) {
+                console.log("[pwmgr] auto captcha filled:", r.text);
+              } else if (r && r.code) {
+                console.log("[pwmgr] auto captcha skipped:", r.code);
+              }
+            }).catch((e) => {
+              console.warn("[pwmgr] auto captcha threw:", e);
+            });
+          }, 500);
+        } else {
+          console.log("[pwmgr] background 沒給 fill:", resp && resp.code, "(這是正常:可能此 tab 不是 launchAndFill 開的)");
+        }
+      });
+    };
+    const observer = new MutationObserver(tryClaim);
+    const target = document.body || document.documentElement;
+    if (target) {
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["style", "class", "type", "disabled", "hidden"],
+      });
+    }
+    const pollId = setInterval(tryClaim, 300);
+    const timeoutId = setTimeout(() => {
+      if (!done) {
+        done = true;
+        cleanup();
+        console.log("[pwmgr] watch hard timeout (60s), giving up");
+      }
+    }, maxWaitMs + 1000);
+    function cleanup() {
+      try { observer.disconnect(); } catch (_) {}
+      clearInterval(pollId);
+      clearTimeout(timeoutId);
+    }
+    // 立即跑一次檢查(page load 完可能 input 已經在了)
+    tryClaim();
+  })();
+
+  // 判斷 page 上是否已有「登入表單」任一徵兆(可見的 email/username input 或 password input)。
+  // 用於 watcher 條件 — Dell SWBM 兩步驟 SSO 第一步只有 email,沒有 password,
+  // 也要算登入表單,以便兩步驟流程完整自動化。
+  function isLoginFormLikely() {
+    const usable = Array.from(document.querySelectorAll("input")).filter(isUsable);
+    if (usable.length === 0) return false;
+    for (const el of usable) {
+      if (findPasswordCandidates().includes(el)) return true;
+      // email/username/text/search 類,且不是 captcha
+      const t = (el.type || "").toLowerCase();
+      if (["email", "text", "tel", "url", "search", ""].includes(t) && !looksLikeCaptchaField(el)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 兩步驟 SSO 第一步:email + Continue/Next 按鈕,沒有 password。
+  // 自動 click Next 讓 page navigation 到密碼頁。
+  // 嚴格條件降低誤觸風險:
+  //   1. 按鈕必須在某個 <form> 內(避免 click cookie banner 等非登入 UI)
+  //   2. 按鈕文字必須嚴格匹配關鍵字(避免 click 到「Cancel」之類的)
+  //   3. 過濾不可見 / disabled 的按鈕
+  function tryClickNextButton() {
+    const keywords = /^(continue|next|proceed|sign\s*in|signin|log\s*in|login|登入|下一步|繼續|確認)$/i;
+    const forms = document.querySelectorAll("form");
+    for (const form of forms) {
+      // 只看 form 內的 submit-like button
+      const candidates = Array.from(
+        form.querySelectorAll('button, input[type="submit"], input[type="button"]')
+      ).filter(isUsable);
+      for (const btn of candidates) {
+        const text = (
+          btn.value ||
+          btn.textContent ||
+          btn.getAttribute("aria-label") ||
+          ""
+        ).trim();
+        if (keywords.test(text)) {
+          console.log("[pwmgr] 兩步驟 SSO:點擊 Next/Continue 按鈕:", JSON.stringify(text));
+          btn.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }
 
   function fillForm(username, password) {
     const passwordInputs = findPasswordCandidates();
     if (passwordInputs.length === 0) {
-      // 部分網站(如 Google/Microsoft)採兩步驟登入:先填帳號、按「繼續」後密碼欄位才出現。
-      // 先填帳號,再等待密碼欄位出現後自動補填。
+      // 部分網站(如 Dell SWBM / Google / Microsoft)採兩步驟登入:
+      // 先填 email,按「Continue」後密碼欄位才出現。
+      // 先填 email,然後嘗試自動 click Continue 跳到密碼頁;若無對應按鈕則 fallback 等密碼欄位。
       const filledUsername = fillUsernameOnly(username);
       if (filledUsername) {
-        console.log("[pwmgr] 尚無密碼欄位,已先填帳號,等待密碼欄位出現");
-        waitForPasswordField(username, password);
+        console.log("[pwmgr] 尚無密碼欄位,已先填帳號");
+        const clicked = tryClickNextButton();
+        if (!clicked) {
+          // 沒找到 Continue/Next 按鈕(可能 user 手動按、或其他文字)— 等密碼欄位出現後自動補填
+          console.log("[pwmgr] 未找到 Continue/Next 按鈕,改為等待密碼欄位出現後補填");
+          waitForPasswordField(username, password);
+        }
+        // click 成功的話:page 會 navigation,舊 content script 卸載,
+        // 新 content script 在 Step 2 注入後由 watcher 自動要 fill → 填入密碼。
       } else {
         // 頁面還在 SPA 載入中、連帳號欄位都還沒 render。
         // 等任何 input 出現後再嘗試一次(整個流程重來)。
@@ -547,4 +664,22 @@
     sendResponse({ ok: true, found: !!input, hasImg: true });
     return false;
   });
+
+  // 暴露 fillForm 給 executeScript 直接呼叫,繞過 listener race / storage race。
+  // 用 unique-ish key 降低被其他 extension 誤觸的風險(並非真正安全隔離)。
+  // executeScript 注入的 func 會 await __pwmgrDoFill__ 直到可用,然後呼叫填入。
+  try {
+    window.__pwmgrDoFill__ = function (username, password) {
+      try {
+        fillForm(username || "", password || "");
+        return true;
+      } catch (e) {
+        console.warn("[pwmgr] __pwmgrDoFill__ error:", e && e.message || e);
+        return false;
+      }
+    };
+  } catch (e) {
+    // 某些 page 鎖死 window(不常見),略過
+    console.warn("[pwmgr] cannot expose __pwmgrDoFill__:", e && e.message || e);
+  }
 })();
