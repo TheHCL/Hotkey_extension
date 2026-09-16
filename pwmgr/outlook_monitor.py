@@ -196,6 +196,7 @@ class OutlookMonitor:
         max_entries: int = 10,
         poll_interval_seconds: float = 3.0,
         subscribed_stores: list[str] | None | object = None,  # None = 自動偵測, [] = 不訂, list = 指定
+        enabled: bool = True,
     ) -> None:
         self._cache_path = Path(cache_path)
         # 編譯成 case-insensitive regex(支援複雜 pattern + 容錯大小寫/前綴後綴)
@@ -217,6 +218,8 @@ class OutlookMonitor:
         else:
             self._subscribed_stores = subscribed_stores  # type: ignore[assignment]
 
+        self._enabled = bool(enabled)
+
         self._lock = threading.Lock()
         self._codes: list[dict[str, Any]] = []  # newest first
         self._items: Any = None  # 持有 reference 避免 COM 物件被 GC
@@ -233,7 +236,13 @@ class OutlookMonitor:
 
         thread 啟動後真正的 Outlook attach 在另一條 thread 跑,失敗會 print
         不 raise;若需精細狀態請看 ``status()``。
+
+        enabled=False 時直接 return False,不開 thread、不 dispatch Outlook —
+        給 user 一個明確的「不用 OTP 就完全不打擾 Outlook」的開關。
         """
+        if not self._enabled:
+            print("[pwmgr][outlook] OTP 監聽已停用(由 otp_enabled 旗標控制),跳過啟動")
+            return False
         if self._thread is not None and self._thread.is_alive():
             return True
         if not _HAS_PYWIN32:
@@ -247,6 +256,22 @@ class OutlookMonitor:
         )
         self._thread.start()
         return True
+
+    def set_enabled(self, enabled: bool) -> None:
+        """即時切換開關。
+
+        enabled=False:把 _stopped 設 True,thread 下輪 sleep 後自然退出,
+        不會中斷當下 PumpWaitingMessages。Outlook COM 也會在 finally 釋放。
+        enabled=True:僅更新旗標,需要 caller 額外呼叫 start() 才會真的開 thread
+        (GUI 通常會 stop 舊 monitor 再 create 一個新的,邏輯更清楚)。
+        """
+        self._enabled = bool(enabled)
+        if not self._enabled:
+            self._stopped = True
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
 
     def stop(self, timeout: float = 3.0) -> None:
         """設 stop flag,等 thread 自然退出(最多 ``timeout`` 秒)。

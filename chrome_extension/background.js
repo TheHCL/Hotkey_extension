@@ -181,6 +181,73 @@ function scheduleExecuteScriptFill(tabId, username, password) {
   console.log("[pwmgr] scheduleExecuteScriptFill armed for tab", tabId, "20 attempts over ~40s");
 }
 
+// --- executeScript 注入的 otpFillFn -----------------------------------------
+//
+// 跟 fillFnExecutedScript 同樣 pattern:serialize 注入 page context 執行,
+// 不能 closure 任何 background.js 變數,只能用 page context 全域 API。
+//
+// 用在 fillOtp 的 fallback 情境:
+//   chrome://extensions Reload 會把已注入分頁的 content script 整個踢掉,
+//   下次 page reload 才會重新注入。此時 popup 點 OTP → background →
+//   chrome.tabs.sendMessage 會 throw(content script listener 不在)。
+//   manifest 宣告的 content script 不能用 chrome.scripting.executeScript
+//   { files: [...] } 重新注入(Chrome 限制),所以改成 inline func 直接
+//   跑 OTP box 偵測 + 填入邏輯,繞過 listener。
+//
+// 邏輯跟 content.js 的 fillOtp() 對齊(Dell-specific otpBox class + 6 格 + tail number 排序);
+// 兩邊需要同步改。實務上 OTP 邏輯變動頻率很低,duplication cost 可接受。
+
+async function otpFillFnExecutedScript(code) {
+  const isUsable = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const otpBoxes = Array.from(
+    document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
+  ).filter(isUsable);
+  if (otpBoxes.length < 4) {
+    return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class)" };
+  }
+  // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
+  const getTailNum = (el) => {
+    const m = (el.id || "").match(/(\d+)\s*$/);
+    return m ? parseInt(m[1], 10) : 0;
+  };
+  otpBoxes.sort((a, b) => {
+    const ai = getTailNum(a);
+    const bi = getTailNum(b);
+    if (ai > 0 && bi > 0) return ai - bi;
+    const pos = a.compareDocumentPosition(b);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  });
+  const chars = String(code || "").replace(/\D/g, "").split("");
+  if (chars.length === 0) {
+    return { ok: false, code: "EMPTY_CODE", error: "code 沒有有效數字" };
+  }
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  let filledCount = 0;
+  const n = Math.min(otpBoxes.length, chars.length);
+  for (let i = 0; i < n; i++) {
+    const el = otpBoxes[i];
+    const before = el.value;
+    setter.call(el, chars[i]);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (el.value === chars[i] && before !== chars[i]) filledCount++;
+  }
+  const last = otpBoxes[n - 1];
+  if (last) {
+    try { last.focus(); } catch (_) {}
+  }
+  if (filledCount === 0) {
+    return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: otpBoxes.length };
+  }
+  return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
+}
+
 // --- 原生主機連線管理 -------------------------------------------------------
 
 function connectNative() {
@@ -513,9 +580,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "ping") {
+    // Ping 是 popup init 第一個呼叫,容易踩到 SW cold start + native host Python
+    // 冷啟動(Python import pywin32/keyring 可能 2-5s,Chrome stdin-read timeout
+    // 約 5s,過了就會殺掉 native host process → DISCONNECTED)。
+    //
+    // 解法:第一次失敗(TIMEOUT / DISCONNECTED / NO_HOST)就 disconnect 舊 port、
+    // 重新 connectNative、再 retry 一次,給 cold start 多一次機會。
+    // 第二次也失敗才回未連線。
     (async () => {
-      const resp = await sendNative({ type: "ping" });
-      sendResponse(resp);
+      let resp = await sendNative({ type: "ping" });
+      const transientFailure =
+        resp &&
+        !resp.ok &&
+        (resp.code === "TIMEOUT" ||
+         resp.code === "DISCONNECTED" ||
+         resp.code === "NO_HOST" ||
+         resp.code === "SEND_FAIL");
+      if (transientFailure) {
+        console.log("[pwmgr] ping 第一次失敗,重連 native host 再試一次:", resp.code);
+        if (nativePort) {
+          try { nativePort.disconnect(); } catch (_) {}
+          nativePort = null;
+        }
+        connectNative();
+        // 給新 spawn 的 native host 一點時間讀 stdin(尤其 Python 冷啟動慢)
+        await new Promise((r) => setTimeout(r, 300));
+        resp = await sendNative({ type: "ping" });
+        if (resp && resp.ok) {
+          console.log("[pwmgr] ping 重連後成功");
+        }
+      }
+      sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 沒回應" });
     })();
     return true;
   }
@@ -578,6 +673,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     //     tabId 一致性檢查放 background 比較清楚
     //   - native host 那邊 getOtp 是 popup→background→native → resp 回 popup,
     //     但「把 code 寫進 input」是 page-side 動作,需要 content script 介入
+    //
+    // Fallback path(extension reload 後):Chrome MV3 的 chrome://extensions Reload 會
+    // 把已注入分頁的 content script 整個踢掉,只有下次 page reload 才會重新注入。
+    // 此時 popup 點 OTP → content script listener 不在 → sendMessage throw。
+    // Manifest 宣告的 content script 無法用 chrome.scripting.executeScript { files: [...] }
+    // 重新注入(Chrome 限制),所以 fallback 改成把 OTP 填入邏輯 inline 成 func 直接用
+    // executeScript { func, args } 跑在 page context。跟 fillFnExecutedScript 同樣 pattern,
+    // 詳見 otpFillFnExecutedScript 函式上方註解。
     (async () => {
       const tabId = msg.tabId;
       const code = String(msg.code || "");
@@ -593,11 +696,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
         sendResponse({ ok: true });
       } catch (e) {
-        sendResponse({
-          ok: false,
-          code: "FORWARD_FAIL",
-          error: e && e.message ? e.message : String(e),
-        });
+        // 多半是「Could not establish connection. Receiving end does not exist.」
+        // — content script listener 被 reload 踢掉。fallback:直接在 page context 跑 OTP 填入。
+        const firstError = e && e.message ? e.message : String(e);
+        try {
+          const results = await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            func: otpFillFnExecutedScript,
+            args: [code],
+          });
+          const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+          const filled = flat.find((r) => r && r.ok);
+          if (filled) {
+            console.log("[pwmgr] fillOtp fallback (inline) success:", filled);
+            sendResponse({ ok: true, source: "fallback_inline", filled });
+            return;
+          }
+          const errResult = flat.find((r) => r && !r.ok);
+          if (errResult) {
+            sendResponse({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error });
+            return;
+          }
+          sendResponse({ ok: false, code: "FILL_FAIL", error: "OTP fallback 沒回傳結果" });
+        } catch (e2) {
+          // executeScript 也失敗(tabId 失效 / 非 http(s) / 權限不足)
+          sendResponse({
+            ok: false,
+            code: "FORWARD_FAIL",
+            error: `send: ${firstError} | inline: ${(e2 && e2.message) || String(e2)}`,
+          });
+        }
       }
     })();
     return true;

@@ -6,8 +6,20 @@
 //   4. captcha 偵測:由 popup 觸發,找頁面上疑似 captcha 的 <img> 與對應 input,
 //      把圖轉 dataURL 送 native host 跑 OCR,結果填回 input(失敗就甚麼都不做)
 
+// 防止重複注入:extension reload 後 background 可能用 chrome.scripting.executeScript
+// 把 content.js 重新注入到已開啟的分頁(原 content script 的 isolated world 已被踢掉)。
+// 若同一個 isolated world 內被注入兩次,onMessage listener 會重複註冊,
+// watchForPasswordAndClaim 與 captcha/OTP 偵測的 MutationObserver / Interval 也會重複跑。
+// 用 __pwmgr_injected__ flag 在 IIFE 內入口處 bail out,確保邏輯只跑一次。
+
 (function () {
   "use strict";
+
+  if (window.__pwmgr_injected__) {
+    console.log("[pwmgr] content script 已在,跳過重複注入");
+    return;
+  }
+  window.__pwmgr_injected__ = true;
 
   console.log("[pwmgr] CONTENT SCRIPT INJECTED at", Date.now(), "url=", location.href);
 

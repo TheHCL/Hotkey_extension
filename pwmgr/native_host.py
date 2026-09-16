@@ -376,7 +376,25 @@ _OTP_MAX_AGE_SECONDS_LIMIT = 3600  # 上限 1 小時,避免 caller 傳怪值
 
 
 def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
-    """取得最近一封符合 pattern 的 OTP code。"""
+    """取得最近一封符合 pattern 的 OTP code。
+
+    若 user 在 GUI 把 OTP 主開關關掉(otp_enabled=False),直接回 OTP_DISABLED,
+    不開 Outlook COM、不讀 cache。理由:既然 user 明確表示不想被 OTP 機制
+    打擾,就不該偷偷 on-demand 去戳 Outlook(那也會卡)。
+    """
+    try:
+        from . import settings as otp_settings
+
+        if not otp_settings.get_otp_enabled():
+            return {
+                "ok": False,
+                "code": "OTP_DISABLED",
+                "error": "OTP 監聽已停用(請到 PWmgr GUI「OTP 監聽設定」啟用)",
+            }
+    except Exception:
+        # settings 讀失敗不擋 — fallback 走原本流程
+        pass
+
     max_age = req.get("max_age_seconds")
     if max_age is None:
         max_age = OTP_CACHE_TTL_SECONDS

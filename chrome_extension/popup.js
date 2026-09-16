@@ -79,16 +79,46 @@ function resolveGroupColor(key, groupColorsMap) {
   return GROUP_PALETTE[groupColorIndex(key)];
 }
 
+async function pingWithRetry(maxAttempts, perAttemptTimeoutMs) {
+  // Chrome 會 idle-kill service worker (~30s 沒活動),下次開 popup → SW cold start
+  // → native host Python 也要冷啟動(import pywin32/keyring 等可達 2-5s)。
+  // chrome.runtime.sendMessage 本身沒有 timeout,但 background 內部 sendNative 有
+  // 15s timeout — 第一次 ping 失敗時 background 會 reconnect + retry 一次,
+  // 這裡再加一個 8s 等候避免 popup 跟著 cold start 卡死。
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let timer = null;
+    try {
+      const resp = await Promise.race([
+        chrome.runtime.sendMessage({ type: "ping" }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("ping no-response")), perAttemptTimeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (resp && resp.ok) return resp;
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      // 等一下再試,給 SW / native host 多一點暖機時間
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    }
+  }
+  return null;
+}
+
 async function init() {
-  // 1. 連線檢查
-  const pingResp = await chrome.runtime.sendMessage({ type: "ping" });
+  // 1. 連線檢查(背景 SW cold start + native host Python cold start 可能數秒)
+  const pingResp = await pingWithRetry(/* maxAttempts */ 2, /* perAttemptTimeoutMs */ 8000);
   if (pingResp && pingResp.ok) {
     $conn.textContent = "已連線";
     $conn.classList.add("ok");
   } else {
     $conn.textContent = "未連線";
     $conn.classList.add("bad");
-    showEmpty("找不到原生主機。請確認 python install.py 已執行且擴充 ID 已註冊。");
+    showEmpty(
+      "找不到原生主機。請確認 PWmgr 已啟動且常駐,或重新開啟 extension(service worker 可能剛被 idle-kill)。"
+    );
     return;
   }
 
@@ -256,6 +286,8 @@ async function onOtpClick() {
         setStatus("Outlook 還沒收到驗證碼信,稍候再試");
       } else if (code === "OUTLOOK_UNAVAILABLE" || code === "PYWIN32_MISSING") {
         setStatus(`Outlook 無法使用(${err}),請確認 Outlook 已開 + PWmgr 常駐`);
+      } else if (code === "OTP_DISABLED") {
+        setStatus("OTP 監聽已停用,請到 PWmgr GUI「OTP 監聽設定」啟用");
       } else if (code === "EXCEPTION") {
         setStatus(`background 例外:${err}(看 chrome://extensions > service worker console)`);
       } else if (code === "EMPTY") {
