@@ -5,6 +5,9 @@
 //   3. 設值後派發 input + change 事件(React/Vue 受控元件才會更新 state)
 //   4. captcha 偵測:由 popup 觸發,找頁面上疑似 captcha 的 <img> 與對應 input,
 //      把圖轉 dataURL 送 native host 跑 OCR,結果填回 input(失敗就甚麼都不做)
+//   5. login trigger 站台(如 Dell SSO landing):先請 background 把帳密存成
+//      pendingFill,再點 login 按鈕觸發 SSO 跳轉,redirect 後新頁面的 content
+//      script 透過 claimPendingFill 撿到帳密繼續填。
 
 // 防止重複注入:extension reload 後 background 可能用 chrome.scripting.executeScript
 // 把 content.js 重新注入到已開啟的分頁(原 content script 的 isolated world 已被踢掉)。
@@ -29,13 +32,15 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "fill") {
       console.log("[pwmgr] content received fill", msg.username ? "(has username)" : "(no username)");
-      try {
-        fillForm(msg.username || "", msg.password || "");
-      } catch (e) {
-        console.warn("[pwmgr] fill error:", e);
-      } finally {
-        window.__pwmgr_filling__ = false;
-      }
+      (async () => {
+        try {
+          await fillFormWithLoginTrigger(msg.username || "", msg.password || "");
+        } catch (e) {
+          console.warn("[pwmgr] fill error:", e);
+        } finally {
+          window.__pwmgr_filling__ = false;
+        }
+      })();
       // 自動接 captcha(若有)。延遲 500ms 讓頁面把 captcha 圖/輸入框 render 出來再嘗試。
       // solveCaptcha 找不到會回 ok:false 自行處理,這裡 fire-and-forget。
       if (msg.auto_captcha !== false) {
@@ -191,6 +196,170 @@
       }
     }
     return false;
+  }
+  // 啟動後主動問 background 有沒有 pending fill(解決 MV3 sendMessage 與
+  // content script listener attach 之間的 race condition)。
+  //
+  // 同時 claim 兩個 slot:
+  //   - regular pendingFill:launchAndFill 一進場就 setPendingFill
+  //   - loginTriggerPending:Dell SSO landing 頁 handleLoginTriggerSite 在 click 前設定
+  // 兩個隔離開才不會 race(原本都擠 pendingFill,setupLoginTrigger 跟 claimPendingFill
+  // 會互搶)。
+  setTimeout(async function () {
+    // 從 window 或 message sender 拿 tabId(content script 沒有直接的 tabId API,
+    // 改由 background 從 sender.tab.id 推斷;若 sender 沒給,我們仍送但不帶 tabId,
+    // background 會從 storage 比對)
+    let resp = null;
+    try {
+      const [regular, loginTrigger] = await Promise.all([
+        chrome.runtime.sendMessage({ type: "claimPendingFill" }).catch(function () { return null; }),
+        chrome.runtime.sendMessage({ type: "claimLoginTrigger" }).catch(function () { return null; }),
+      ]);
+      // 優先用 loginTrigger(若 setupLoginTrigger 已設,代表已經 click 過,
+      // 來到 SSO 頁,直接填即可);fallback 用 regular
+      resp = (loginTrigger && loginTrigger.ok) ? loginTrigger : regular;
+    } catch (e) {
+      console.warn("[pwmgr] claim error:", e);
+    }
+    if (resp && resp.ok && resp.username != null) {
+      console.log("[pwmgr] content claimed pending fill");
+      try {
+        await fillFormWithLoginTrigger(resp.username || "", resp.password || "");
+      } catch (e) {
+        console.warn("[pwmgr] claim fill error:", e);
+      } finally {
+        window.__pwmgr_filling__ = false;
+      }
+      // claimPendingFill 也代表「launchAndFill 開新分頁的自動流程」,同樣串 captcha
+      setTimeout(() => {
+        solveCaptcha().then((r) => {
+          if (r && r.ok) {
+            console.log("[pwmgr] auto captcha filled:", r.text);
+          } else if (r && r.code) {
+            console.log("[pwmgr] auto captcha skipped:", r.code);
+          }
+        }).catch((e) => {
+          console.warn("[pwmgr] auto captcha threw:", e);
+        });
+      }, 500);
+    }
+  }, 200);
+
+  // ===== Login trigger 站台(Dell SSO 等) =====================================
+  //
+  // 流程:
+  //   1. 偵測目前 URL 是否在 LOGIN_TRIGGER_SITES 清單內
+  //   2. 找到「登入」按鈕(用文字 + aria-label 模糊比對)
+  //   3. 請 background 把帳密暫存成 pendingFill(同 tabId)
+  //   4. 點按鈕 → 觸發 SSO redirect → 頁面 navigate → 當前 content script 死掉
+  //   5. redirect 後的新頁面載入新 content script → claimPendingFill 撿到帳密 → 填入
+  //
+  // 重要:必須先存再點。順序反過來的話 click 會立即 navigate,內容腳本來不及送
+  // setupLoginTrigger 訊息給 background。
+  //
+  // 注意:login 按鈕若用 target="_blank" 開新 tab,目前流程不會處理(pending fill
+  // 會綁在原 tabId,新 tab 撈不到)。Dell 兩個站台都是同 tab 跳轉,先這樣。
+
+  const LOGIN_TRIGGER_SITES = [
+    /^https:\/\/testvault\.dell\.com\//i,
+    /^https:\/\/boss\.dell\.com\//i,
+  ];
+
+  function isLoginTriggerSite(url) {
+    if (!url) return false;
+    return LOGIN_TRIGGER_SITES.some((re) => re.test(url));
+  }
+
+  function findLoginButton() {
+    // 候選:可見的 <a> / <button> / [role=button] / <input type=submit>
+    const candidates = Array.from(
+      document.querySelectorAll('a, button, [role="button"], input[type="submit"], input[type="button"]')
+    ).filter(isUsable);
+    // 文字 / aria-label / title / value 中任一命中:
+    //   - 英:login / sign in / log on / sign-in / log-in
+    //   - 繁中:登入 / 登錄 / 登入帳戶
+    //   - 簡中:登录 / 登入
+    //   - 日:ログイン
+    //   - 韓:로그인
+    //   - 德/法/義/西/葡 沒列——Dell IBP 主要是英中
+    const loginRe = /\blog[\s\-]*in\b|\bsign[\s\-]*in\b|\blog\s*on\b|登入|登錄|登录|ログイン|로그인/i;
+    const hits = [];
+    for (const el of candidates) {
+      const haystack = (
+        (el.textContent || "") + " " +
+        (el.getAttribute("aria-label") || "") + " " +
+        (el.title || "") + " " +
+        (el.value || "")
+      ).trim();
+      if (!loginRe.test(haystack)) continue;
+      // 排除明顯是登出 / 切換帳號連結(避免點錯)
+      if (/\blog\s*out\b|\bsign\s*out\b|\bswitch\s*(user|account)\b/i.test(haystack)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      hits.push({ el, area: r.width * r.height });
+    }
+    if (hits.length === 0) return null;
+    // 取面積最大(最顯眼)的當作主登入鈕
+    hits.sort((a, b) => b.area - a.area);
+    return hits[0].el;
+  }
+
+  async function handleLoginTriggerSite(username, password) {
+    console.log("[pwmgr] login trigger 站台:", location.href);
+    const btn = findLoginButton();
+    if (!btn) {
+      // 沒按鈕 → 降級走 fillForm;landing 頁通常沒 password 欄位,只會印 log 無害
+      console.log("[pwmgr] 找不到 login 按鈕,降級走一般 fillForm");
+      return false;
+    }
+    // 1. 先把帳密交給 background 存成 pendingFill,redirect 後新分頁的
+    //    content script 才撈得到。必須在 click 之前送達。
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: "setupLoginTrigger",
+        username,
+        password,
+        url: location.href,
+      });
+      if (!resp || !resp.ok) {
+        console.warn("[pwmgr] setupLoginTrigger 失敗:", resp);
+        return false;
+      }
+    } catch (e) {
+      console.warn("[pwmgr] setupLoginTrigger 例外:", e);
+      return false;
+    }
+    // 2. 記下點擊前的 URL,等下判斷是 navigate(SSO 跳轉)還是同頁(modal)
+    const startHref = location.href;
+    console.log("[pwmgr] 點 login 按鈕(觸發 SSO 跳轉):", btn.textContent && btn.textContent.trim());
+    btn.click();
+    // 3. 觀察 250ms:
+    //    - URL 變了 → navigate 走了 → 新分頁的 content script 接手,return true
+    //    - URL 沒變 → 可能是 modal/同頁登入 → 清掉 pendingFill(用不到),
+    //      return false 讓 caller 走 fillForm 填 modal
+    await new Promise((r) => setTimeout(r, 250));
+    if (location.href !== startHref) {
+      console.log("[pwmgr] URL 已變(已 navigate),新頁面 content script 接手");
+      return true;
+    }
+    console.log("[pwmgr] URL 未變,可能是 modal,清 pendingFill 並降級走 fillForm");
+    try {
+      await chrome.runtime.sendMessage({ type: "cancelLoginTrigger" });
+    } catch (_) {
+      // 清不掉也沒關係,TTL 30s 會自動過期
+    }
+    return false;
+  }
+
+  // fillForm 的 async 包裝:login trigger 站台先點按鈕再走原有流程。
+  // 兩個 fill 入口(popup fill message + claimPendingFill)都改用這個。
+  async function fillFormWithLoginTrigger(username, password) {
+    if (isLoginTriggerSite(location.href)) {
+      const handled = await handleLoginTriggerSite(username, password);
+      if (handled) return; // 點完就等新頁面的 content script 接續
+      // 找不到按鈕 → 降級走一般 fillForm
+    }
+    fillForm(username, password);
   }
 
   function fillForm(username, password) {
