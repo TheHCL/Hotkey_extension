@@ -84,7 +84,10 @@ class PwmgrApp:
             HOTKEY_MODIFIERS, HOTKEY_KEY, self._on_hotkey, self._hotkey_q
         )
         self._tray = TrayIcon(
-            on_show=self._show_window, on_quit=self._quit_app
+            on_show=self._show_window,
+            on_quit=self._quit_app,
+            on_toggle_otp=self._toggle_otp_from_tray,
+            is_otp_enabled=otp_settings.get_otp_enabled,
         )
 
         # Outlook OTP 監聽(PWmgr 常駐 → 由這裡掛 Outlook COM event sink,
@@ -1371,6 +1374,44 @@ class PwmgrApp:
         )
 
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _toggle_otp_from_tray(self) -> None:
+        """從 system tray 的「OTP 監聽」checkable menu 觸發。
+
+        流程(刻意從 tray 自己的 thread marshal 回 Tk thread,因為 pystray
+        menu callback 不一定在 Tk main thread 跑 — 直接碰 self.status_var
+        在某些 Windows + Tk 版本會偶發拋 ``Tcl_AsyncDelete``):
+
+          1. 讀目前 enabled 旗標 → 取反
+          2. 寫回 settings.json(下次 GUI 重啟會記得)
+          3. 重啟 OTP monitor(沿用目前 subscribed_stores,不動 store 清單)
+          4. 通知 tray 重建 menu(讓 ✓/☐ 狀態刷新)
+          5. 推一個 tray 通知 + GUI status bar 提示
+
+        訂閱 store 清單**不變** — 只是 master enable toggle,
+        不影響 user 在「OTP 監聽設定」做的 store 選擇。
+        """
+        # pystray menu callback 通常在非 Tk thread;統一 marshal 回 main thread。
+        self.root.after(0, self._do_toggle_otp_from_tray)
+
+    def _do_toggle_otp_from_tray(self) -> None:
+        current = otp_settings.get_otp_enabled()
+        new_state = not current
+        try:
+            otp_settings.set_otp_enabled(new_state)
+        except Exception as e:
+            self._set_status(f"⚠ OTP 開關切換失敗:{e}")
+            return
+        # subscribed_stores 保留現況,只翻 master enable
+        self._restart_otp_monitor(otp_settings.get_otp_subscribed_stores())
+        # 通知 tray menu 重建(讓 ✓/☐ 刷新)
+        self._tray.update_menu()
+        # 推一個 tray 通知(讓 user 在沒看 tray menu 時也能看到變更)
+        msg = "OTP 監聽已啟用" if new_state else "OTP 監聽已停用(Outlook 不再被打擾)"
+        try:
+            self._tray.notify("PWmgr", msg)
+        except Exception:
+            pass
 
     def _restart_otp_monitor(self, subscribed_stores: list[str] | None) -> None:
         """停止舊的 OTP monitor thread,建一個新的套用新訂閱設定。
