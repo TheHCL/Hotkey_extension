@@ -26,8 +26,17 @@ import sys
 import threading
 from typing import Any
 
-from . import storage
-from .config import MAX_CAPTCHA_BYTES, MAX_GROUP_CHARS, MAX_PASSWORD_BYTES
+from . import outlook_monitor, storage
+from .config import (
+    MAX_CAPTCHA_BYTES,
+    MAX_GROUP_CHARS,
+    MAX_PASSWORD_BYTES,
+    OTP_CACHE_TTL_SECONDS,
+    OTP_CODE_REGEX,
+    OTP_LOOKBACK_COUNT,
+    OTP_SUBJECT_PATTERNS,
+    otp_cache_path,
+)
 from .models import PasswordEntry
 
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -352,6 +361,54 @@ def _handle_solve_captcha(req: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- OTP 自動填 ----------------------------------------------------------------
+#
+# 由 Chrome extension 透過 popup 觸發:user 在 OTP 頁按下「取得驗證碼」按鈕 →
+# popup → background → native host → 此 handler。
+#
+# 流程:
+#   1. 讀 PWmgr GUI 的 outlook_monitor 寫的 cache JSON(快,通常命中)
+#   2. cache miss 或過期 → on-demand 開 Outlook COM 翻最近 Inbox(慢但可用)
+#
+# outlook_monitor.get_latest_otp 已把以上兩個策略封裝好,直接呼叫。
+
+_OTP_MAX_AGE_SECONDS_LIMIT = 3600  # 上限 1 小時,避免 caller 傳怪值
+
+
+def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
+    """取得最近一封符合 pattern 的 OTP code。"""
+    max_age = req.get("max_age_seconds")
+    if max_age is None:
+        max_age = OTP_CACHE_TTL_SECONDS
+    if not isinstance(max_age, int) or max_age <= 0:
+        raise BadRequestError("max_age_seconds 必須是正整數")
+    max_age = min(max_age, _OTP_MAX_AGE_SECONDS_LIMIT)
+
+    result = outlook_monitor.get_latest_otp(
+        cache_path=otp_cache_path(),
+        subject_patterns=OTP_SUBJECT_PATTERNS,
+        code_regex=OTP_CODE_REGEX,
+        max_age_seconds=max_age,
+        # on-demand fallback 才會用到
+        # (get_latest_otp 內部呼叫 fetch_latest_otp;lookback 透過 OTP_LOOKBACK_COUNT 預設)
+    )
+    # 額外附帶一些 debug 資訊給 popup(不影響 content script 邏輯)
+    if isinstance(result, dict) and result.get("ok"):
+        return {
+            "ok": True,
+            "code": str(result.get("code", "")),
+            "subject": str(result.get("subject", "")),
+            "received_at": float(result.get("received_at", 0.0)),
+            "source": str(result.get("source", "")),
+        }
+    # 失敗也照原樣回(讓前端用 code 欄位判斷錯誤種類)
+    return result if isinstance(result, dict) else {
+        "ok": False,
+        "code": "UNKNOWN",
+        "error": "outlook_monitor 回傳格式錯誤",
+    }
+
+
 _DISPATCH: dict[str, Any] = {
     "query": _handle_query,
     "fetch": _handle_fetch,
@@ -363,6 +420,7 @@ _DISPATCH: dict[str, Any] = {
     "get_group_colors": _handle_get_group_colors,
     "set_group_color": _handle_set_group_color,
     "solve_captcha": _handle_solve_captcha,
+    "get_otp": _handle_get_otp,
 }
 
 

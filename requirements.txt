@@ -2,6 +2,10 @@ keyring>=24.0
 pystray>=0.19
 Pillow>=10.0
 pytest>=7.0
+# OTP 自動填(Outlook COM 監聽 → OTP 快取 → extension 按鈕觸發填入)
+# PWmgr GUI 主程式開守護 thread 跑 win32com 監聽 Inbox 新信,
+# native host 讀 cache 即可按需回傳驗證碼(無需每次重啟 COM)。
+pywin32>=306; sys_platform == "win32"
 # captcha 自動填入(extension 偵測到 captcha 圖後送進 native host 跑 OCR)
 # 兩個預訓練模型(std + beta)做 ensemble,僅一致時才回答案。
 # 首次 import 會拉 ~25MB onnxruntime 依賴。

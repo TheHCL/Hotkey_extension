@@ -665,6 +665,99 @@
     return false;
   });
 
+  // ===== OTP 自動填(Dell 風格 otpBox 多格輸入) =====================================
+  //
+  // 偵測目標(Dell):
+  //   <input class="otpBox ..." maxlength="1" type="tel" autocomplete="one-time-code">
+  //   同一 form-group 內 6 格並排,id 像 otpBoxmfaOtpBox1..6
+  //
+  // 為何限定 otpBox class(Dell-specific 而非通用):
+  //   - user 明確選 Dell 專用:避免誤觸普通 input(如電話分機、數量…)
+  //   - 6 格並排 + maxlength=1 + autocomplete=one-time-code 三者同時成立仍可能誤判
+  //
+  // 排序策略:用 id 尾端數字(Dell 的 otpBoxmfaOtpBox1..6);抓不到就退回 DOM 順序。
+  // 大部分網站把這 6 格依序放在同一個 container,DOM 順序通常就是 1→6。
+  function findOtpBoxes() {
+    const otpBoxes = Array.from(
+      document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
+    ).filter(isUsable);
+    if (otpBoxes.length < 4) return [];
+    // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
+    const getTailNum = (el) => {
+      const m = (el.id || "").match(/(\d+)\s*$/);
+      return m ? parseInt(m[1], 10) : 0;
+    };
+    const sorted = otpBoxes.slice().sort((a, b) => {
+      const ai = getTailNum(a);
+      const bi = getTailNum(b);
+      if (ai > 0 && bi > 0) return ai - bi;
+      // 至少一邊沒數字 id → 用 DOM 順序(a 是不是 b 的 preceding)
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    return sorted;
+  }
+
+  function fillOtp(code) {
+    const boxes = findOtpBoxes();
+    if (boxes.length === 0) {
+      return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class)" };
+    }
+    // 過濾非數字,Dell OTP 一定是 6 位數;若 native host 回 alphanumeric 也安全(只取數字部分)
+    const chars = String(code || "").replace(/\D/g, "").split("");
+    if (chars.length === 0) {
+      return { ok: false, code: "EMPTY_CODE", error: "code 沒有有效數字" };
+    }
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    let filledCount = 0;
+    const n = Math.min(boxes.length, chars.length);
+    for (let i = 0; i < n; i++) {
+      const el = boxes[i];
+      const before = el.value;
+      setter.call(el, chars[i]);
+      // React / Vue / jQuery 監聽 input / change 才能同步內部 state
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (el.value === chars[i] && before !== chars[i]) filledCount++;
+    }
+    // focus 最後一個有填的格,符合 user 打完最後一碼的視覺習慣
+    const last = boxes[n - 1];
+    if (last) {
+      try { last.focus(); } catch (_) {}
+    }
+    if (filledCount === 0) {
+      return {
+        ok: false,
+        code: "FILL_NOOP",
+        error: "OTP 輸入框已存在值或拒絕寫入(可能已被 user 手動填過)",
+        total: boxes.length,
+      };
+    }
+    return { ok: true, filled: filledCount, total: boxes.length, code: chars.join("") };
+  }
+
+  // popup 詢問「目前頁面有沒有 OTP box」→ 決定要不要顯示 OTP 按鈕
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || msg.type !== "detectOtp") return false;
+    const boxes = findOtpBoxes();
+    sendResponse({ ok: true, found: boxes.length >= 4, count: boxes.length });
+    return false;
+  });
+
+  // background 把 OTP code 轉發過來 → 寫進 boxes
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || msg.type !== "fillOtp") return false;
+    try {
+      const r = fillOtp(msg.code);
+      sendResponse(r);
+    } catch (e) {
+      sendResponse({ ok: false, code: "EXCEPTION", error: e && e.message || String(e) });
+    }
+    return false;
+  });
+
   // 暴露 fillForm 給 executeScript 直接呼叫,繞過 listener race / storage race。
   // 用 unique-ish key 降低被其他 extension 誤觸的風險(並非真正安全隔離)。
   // executeScript 注入的 func 會 await __pwmgrDoFill__ 直到可用,然後呼叫填入。

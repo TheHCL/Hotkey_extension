@@ -19,14 +19,18 @@ from tkinter import font as tkfont
 from typing import Any
 from urllib.parse import urlparse
 
-from . import storage
+from . import outlook_monitor, settings as otp_settings, storage
 from .config import (
     CLIPBOARD_CLEAR_SECONDS,
     EXTENSION_DIR,
     HOTKEY_KEY,
     HOTKEY_MODIFIERS,
+    OTP_CACHE_TTL_SECONDS,
+    OTP_CODE_REGEX,
+    OTP_SUBJECT_PATTERNS,
     URL_POLL_INTERVAL_MS,
     app_dir,
+    otp_cache_path,
 )
 from .hotkey import GlobalHotkey
 from .matcher import matches, registered_domain
@@ -83,6 +87,24 @@ class PwmgrApp:
             on_show=self._show_window, on_quit=self._quit_app
         )
 
+        # Outlook OTP 監聽(PWmgr 常駐 → 由這裡掛 Outlook COM event sink,
+        # 收到符合 subject pattern 的信就 regex 抽 6 位數 OTP 寫進 cache JSON)。
+        # native host 的 get_otp 讀這個 cache;cache miss 才 fallback on-demand 查詢。
+        # start() 失敗不 raise(Outlook 未裝時 GUI 照常運作)。
+        # subscribed_stores 從 settings.json 讀(可在 GUI「OTP 監聽設定」改);
+        # None = 自動偵測 Exchange mailbox + Outlook profile,[] = 不訂閱。
+        try:
+            _subscribed_stores = otp_settings.get_otp_subscribed_stores()
+        except Exception:
+            _subscribed_stores = None
+        self._otp_monitor = outlook_monitor.OutlookMonitor(
+            cache_path=otp_cache_path(),
+            subject_patterns=OTP_SUBJECT_PATTERNS,
+            code_regex=OTP_CODE_REGEX,
+            ttl_seconds=OTP_CACHE_TTL_SECONDS,
+            subscribed_stores=_subscribed_stores,
+        )
+
         self._entries: list[PasswordEntry] = []
         self._current_url: str | None = None
         self._selected_id: str | None = None
@@ -95,6 +117,7 @@ class PwmgrApp:
         self._start_url_poll()
         self._hotkey.start()
         self._tray.start()
+        self._otp_monitor.start()
 
         # 啟動時先縮到 tray(熱鍵顯示)
         self.root.after(200, self._hide_to_tray)
@@ -225,6 +248,10 @@ class PwmgrApp:
         group_menu = tk.Menu(menubar, tearoff=False)
         group_menu.add_command(label="編輯群組顏色...", command=self._open_group_colors_dialog)
         menubar.add_cascade(label="群組", menu=group_menu)
+
+        otp_menu = tk.Menu(menubar, tearoff=False)
+        otp_menu.add_command(label="OTP 監聽設定...", command=self._open_otp_settings_dialog)
+        menubar.add_cascade(label="OTP", menu=otp_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="關於 PWmgr", command=self._show_about)
@@ -957,6 +984,13 @@ class PwmgrApp:
     def _do_quit(self) -> None:
         self._hotkey.stop()
         self._tray.stop()
+        # Outlook monitor 是 daemon thread,理論上 process 退出會自動結束。
+        # 顯式 stop 是禮貌做法 — 等 thread 把自己清乾淨(< 3 秒),
+        # 避免 CoUninitialize / cache flush 還沒跑就被中斷。
+        try:
+            self._otp_monitor.stop(timeout=3.0)
+        except Exception:
+            pass
         try:
             self.root.quit()
             self.root.destroy()
@@ -1136,6 +1170,187 @@ class PwmgrApp:
 
     def _set_status(self, msg: str) -> None:
         self.status_var.set(msg)
+
+    # --- OTP 監聽設定 -----------------------------------------------------------
+
+    def _open_otp_settings_dialog(self) -> None:
+        """彈出「OTP 監聽設定」對話框。
+
+        兩個模式:
+          - 自動偵測(預設):訂閱所有 Exchange mailbox(@開頭)+ Outlook profile
+          - 自訂清單:勾選要訂閱的 store,其他忽略
+
+        存檔後會自動重啟 monitor thread,不需要整個 GUI 重開。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("OTP 監聽設定")
+        dlg.transient(self.root)
+        dlg.configure(background=PALETTE["bg"])
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        dlg.geometry("480x420")
+        dlg.minsize(380, 300)
+
+        body = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 16))
+        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        ttk.Label(body, text="OTP 監聽設定", style="Header.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            body,
+            text="選擇 PWmgr 要監聽的 Outlook store。新信進 Inbox 時觸發 OTP 自動填。",
+            style="CardMuted.TLabel",
+            wraplength=440,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(6, 12))
+
+        # 模式選擇
+        mode_var = tk.StringVar(value="auto")
+        mode_frame = ttk.Frame(body, style="Card.TFrame")
+        mode_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Radiobutton(
+            mode_frame,
+            text="自動偵測(Exchange mailbox + Outlook profile)",
+            variable=mode_var,
+            value="auto",
+        ).pack(anchor=tk.W, padx=4)
+        ttk.Radiobutton(
+            mode_frame,
+            text="自訂清單(只勾選下列 store)",
+            variable=mode_var,
+            value="custom",
+        ).pack(anchor=tk.W, padx=4)
+
+        # Store list(Listbox + check 樣式用 extended selection)
+        list_label = ttk.Label(
+            body,
+            text="可勾選的 store(按 Ctrl 多選):",
+            style="CardMuted.TLabel",
+        )
+        list_label.pack(anchor=tk.W, pady=(8, 4))
+
+        list_outer = ttk.Frame(body, style="Card.TFrame", padding=1)
+        list_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        listbox = tk.Listbox(
+            list_outer,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            font=FONT_BASE,
+            background="white",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        sb = ttk.Scrollbar(list_outer, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 偵測所有 store(用 session.Folders)— 這部分從 Outlook COM 抓,可能會慢
+        detected: list[str] = []
+        detection_error: str | None = None
+        try:
+            import win32com.client  # type: ignore
+            import pythoncom  # type: ignore
+
+            pythoncom.CoInitialize()
+            try:
+                # 用跟 monitor 一樣的策略:GetActiveObject → fallback Dispatch
+                try:
+                    outlook = win32com.client.GetActiveObject("Outlook.Application")
+                except Exception:
+                    outlook = win32com.client.Dispatch("Outlook.Application")
+                session = outlook.Session
+                stores = session.Folders
+                for i in range(int(stores.Count)):
+                    try:
+                        sname = str(stores.Item(i + 1).Name or "")
+                        if sname:
+                            detected.append(sname)
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+        except ImportError:
+            detection_error = "pywin32 未安裝"
+        except Exception as e:
+            detection_error = f"{type(e).__name__}: {e}"
+
+        # 填入 listbox + 預設選取
+        current_setting = otp_settings.get_otp_subscribed_stores()
+        for name in detected:
+            listbox.insert(tk.END, name)
+        if current_setting is None:
+            mode_var.set("auto")
+            # 自動模式:預設選取所有 Exchange + Outlook profile(只是視覺提示)
+            for i, name in enumerate(detected):
+                if "@" in name or name == "Outlook":
+                    listbox.selection_set(i)
+        else:
+            mode_var.set("custom")
+            for sname in current_setting:
+                if sname in detected:
+                    idx = detected.index(sname)
+                    listbox.selection_set(idx)
+
+        # 底部狀態 + 按鈕列
+        status_lbl = ttk.Label(body, text="", style="CardMuted.TLabel", wraplength=440)
+        status_lbl.pack(anchor=tk.W)
+        if detection_error:
+            status_lbl.configure(text=f"⚠ 偵測 Outlook store 失敗:{detection_error}")
+
+        def _save() -> None:
+            if mode_var.get() == "auto":
+                new_setting: list[str] | None = None
+            else:
+                sel = listbox.curselection()
+                new_setting = [detected[i] for i in sel]
+                if not new_setting:
+                    status_lbl.configure(text="⚠ 自訂模式至少要勾一個 store")
+                    return
+            try:
+                otp_settings.set_otp_subscribed_stores(new_setting)
+            except Exception as e:
+                status_lbl.configure(text=f"⚠ 存檔失敗:{e}")
+                return
+            # 重啟 monitor thread(不重啟整個 GUI)
+            self._restart_otp_monitor(new_setting)
+            dlg.destroy()
+
+        btn_row = ttk.Frame(body, style="Card.TFrame", padding=(0, 12, 0, 0))
+        btn_row.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="儲存並重啟監聽", style="Accent.TButton", command=_save).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _restart_otp_monitor(self, subscribed_stores: list[str] | None) -> None:
+        """停止舊的 OTP monitor thread,建一個新的套用新訂閱設定。"""
+        try:
+            self._otp_monitor.stop(timeout=3.0)
+        except Exception:
+            pass
+        self._otp_monitor = outlook_monitor.OutlookMonitor(
+            cache_path=otp_cache_path(),
+            subject_patterns=OTP_SUBJECT_PATTERNS,
+            code_regex=OTP_CODE_REGEX,
+            ttl_seconds=OTP_CACHE_TTL_SECONDS,
+            subscribed_stores=subscribed_stores,
+        )
+        self._otp_monitor.start()
+        # 簡短 status 提示
+        if subscribed_stores is None:
+            self._set_status("OTP 監聽已切換為自動偵測模式")
+        elif not subscribed_stores:
+            self._set_status("OTP 監聽已關閉(subscribed_stores=[])")
+        else:
+            self._set_status(f"OTP 監聽已切換:訂閱 {subscribed_stores}")
 
     def _show_about(self) -> None:
         messagebox.showinfo(

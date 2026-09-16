@@ -10,6 +10,7 @@ const $groupMenu = document.getElementById("group-menu");
 const $groupList = document.getElementById("group-list");
 const $navigateToggle = document.getElementById("navigate-toggle");
 const $captchaBtn = document.getElementById("captcha-btn");
+const $otpBtn = document.getElementById("otp-btn");
 
 // captcha 按鈕的 click handler 改在這裡就綁一次,不再放進 async detectCaptchaOnTab
 // 的條件分支內。原因:
@@ -17,6 +18,7 @@ const $captchaBtn = document.getElementById("captcha-btn");
 //     漏綁(這就是先前「按鈕可見但 click 不觸發」的根因)
 //   - 顯示/隱藏交給 $captchaBtn.hidden 控制,handler 本身永遠在
 $captchaBtn.addEventListener("click", onCaptchaClick);
+$otpBtn.addEventListener("click", onOtpClick);
 
 let currentTabId = null;
 let currentUrl = null;
@@ -159,6 +161,8 @@ async function init() {
 
   // 7. captcha 按鈕:目前頁面有偵測到 captcha 才顯示
   detectCaptchaOnTab();
+  // 8. OTP 按鈕:目前頁面有偵測到 otpBox 多格輸入才顯示(Dell 風格)
+  detectOtpOnTab();
 }
 
 async function detectCaptchaOnTab() {
@@ -203,6 +207,99 @@ async function onCaptchaClick() {
   } finally {
     $captchaBtn.disabled = false;
     $captchaBtn.textContent = orig;
+  }
+}
+
+// ===== OTP 自動填 =============================================================
+//
+// popup 流程:
+//   1. user 在 OTP 頁打開 extension → detectOtpOnTab 問 content script
+//      「有沒有 otpBox 多格輸入?」→ 有就顯示按鈕
+//   2. user 按按鈕 → onOtpClick 先問 background 要 OTP code
+//   3. background → native host → 讀 cache(PWmgr GUI monitor 寫的)或
+//      fallback on-demand 查 Outlook
+//   4. 拿到 code 後請 background 轉發給 content script → 填入
+//
+// 兩個獨立 round trip 是刻意的:不要把 native host 的 token 暴露給 content script,
+// 也讓 native host 的回應格式對 popup/background 統一。
+async function detectOtpOnTab() {
+  if (!currentTabId) return;
+  try {
+    const resp = await chrome.tabs.sendMessage(currentTabId, { type: "detectOtp" });
+    // 跟 captcha 一樣:handler 永遠在,只 toggle 顯示
+    $otpBtn.hidden = !(resp && resp.ok && resp.found);
+    console.log("[pwmgr][popup] detectOtp:", resp);
+  } catch (e) {
+    // 沒有 content script(非 http(s) 頁 / SPA 還沒載入)
+    $otpBtn.hidden = true;
+    console.log("[pwmgr][popup] detectOtp threw:", e && e.message || e);
+  }
+}
+
+async function onOtpClick() {
+  console.log("[pwmgr][popup] onOtpClick start, currentTabId=", currentTabId);
+  $otpBtn.disabled = true;
+  const orig = $otpBtn.textContent;
+  $otpBtn.textContent = "取得中…";
+  try {
+    // 1. 跟 native host 要 code
+    const otpResp = await chrome.runtime.sendMessage({ type: "getOtp" });
+    console.log("[pwmgr][popup] getOtp resp:", otpResp);
+    if (!otpResp || !otpResp.ok) {
+      // 常見錯誤:
+      //   NO_CODE → outlook 還沒收到信 / 範圍內沒符合
+      //   OUTLOOK_UNAVAILABLE → pywin32 沒裝 / Outlook 沒在跑
+      //   PYWIN32_MISSING → requirements 漏裝
+      const code = (otpResp && otpResp.code) || "EMPTY";
+      const err = (otpResp && otpResp.error) || "";
+      if (code === "NO_CODE") {
+        setStatus("Outlook 還沒收到驗證碼信,稍候再試");
+      } else if (code === "OUTLOOK_UNAVAILABLE" || code === "PYWIN32_MISSING") {
+        setStatus(`Outlook 無法使用(${err}),請確認 Outlook 已開 + PWmgr 常駐`);
+      } else if (code === "EXCEPTION") {
+        setStatus(`background 例外:${err}(看 chrome://extensions > service worker console)`);
+      } else if (code === "EMPTY") {
+        setStatus("native host 沒回應,請看 chrome://extensions console log");
+      } else {
+        setStatus(`取得失敗:${code} ${err}`);
+      }
+      return;
+    }
+    const code = String(otpResp.code || "");
+    if (!code) {
+      setStatus("native host 回傳空 code,請手動輸入");
+      return;
+    }
+
+    // 2. 把 code 轉發給 content script 填入
+    const fillResp = await chrome.runtime.sendMessage({
+      type: "fillOtp",
+      tabId: currentTabId,
+      code,
+    });
+    console.log("[pwmgr][popup] fillOtp resp:", fillResp);
+    if (fillResp && fillResp.ok) {
+      const ageStr =
+        typeof otpResp.received_at === "number"
+          ? `(${Math.max(0, Math.round(Date.now() / 1000 - otpResp.received_at))}秒前收到)`
+          : "";
+      const srcStr = otpResp.source === "cache" ? "cache" : "live";
+      setStatus(`已填入 ${code}${ageStr} [${srcStr}] — 按 Enter 送出`);
+    } else if (fillResp && fillResp.code === "NOT_FOUND") {
+      setStatus("頁面已變動,找不到 OTP 輸入框(請重新整理)");
+    } else if (fillResp && fillResp.code === "FILL_NOOP") {
+      setStatus("OTP 框已存在值,未覆寫(可能已被 user 填過)");
+    } else if (fillResp && fillResp.code === "FORWARD_FAIL") {
+      setStatus("無法把 code 送到頁面(content script 未就緒)");
+    } else {
+      setStatus(`填入失敗:${(fillResp && (fillResp.code || fillResp.error)) || "unknown"}`);
+    }
+  } catch (e) {
+    console.warn("[pwmgr][popup] onOtpClick threw:", e);
+    setStatus(`例外:${(e && e.message) || e}`);
+  } finally {
+    $otpBtn.disabled = false;
+    $otpBtn.textContent = orig;
   }
 }
 

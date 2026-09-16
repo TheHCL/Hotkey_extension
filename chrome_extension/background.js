@@ -317,7 +317,7 @@ function sendNative(msg) {
     // 5 秒 timeout
     setTimeout(() => {
       settle({ ok: false, code: "TIMEOUT" });
-    }, 5000);
+    }, 15000);
   });
 }
 
@@ -542,6 +542,63 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       const resp = await sendNative({ type: "solve_captcha", ...payload });
       sendResponse(resp);
+    })();
+    return true;
+  }
+
+  if (msg.type === "getOtp") {
+    // popup 觸發:user 按「取得驗證碼」按鈕 → 跟 native host 要最近一筆 OTP code。
+    // native host 先看 cache(PWmgr GUI monitor 寫的),miss 才 fallback on-demand 查 Outlook。
+    // 拿到 code 後不要直接送 content script(本 background 不該知道 tab 細節);
+    // 由 popup 收到 resp 後決定要 forward 給哪個 tab(見 popup.js onOtpClick)。
+    (async () => {
+      try {
+        console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP");
+        const resp = await sendNative({ type: "get_otp" });
+        console.log("[pwmgr] getOtp: native host resp =", resp);
+        // 防呆:sendResponse 一定要有 object (Chrome MV3 不接受 undefined 回應)
+        sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });
+      } catch (e) {
+        console.warn("[pwmgr] getOtp handler 拋例外:", e && e.message || e);
+        // 即使內部 throw 也要 sendResponse,否則 popup 會等滿 5 秒 timeout 拿 undefined
+        try {
+          sendResponse({ ok: false, code: "EXCEPTION", error: String(e && e.message || e) });
+        } catch (_) {
+          // channel 可能已關,沒辦法
+        }
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "fillOtp") {
+    // popup 拿到 OTP code 後,要求 background 把 code 轉發到指定 tab 的 content script。
+    // 為什麼走 background 不用 popup 直接 chrome.tabs.sendMessage:
+    //   - popup 可能在按按鈕時 user 已關掉 → chrome.tabs.sendMessage 仍可,但
+    //     tabId 一致性檢查放 background 比較清楚
+    //   - native host 那邊 getOtp 是 popup→background→native → resp 回 popup,
+    //     但「把 code 寫進 input」是 page-side 動作,需要 content script 介入
+    (async () => {
+      const tabId = msg.tabId;
+      const code = String(msg.code || "");
+      if (!Number.isInteger(tabId)) {
+        sendResponse({ ok: false, code: "BAD_TAB_ID" });
+        return;
+      }
+      if (!code) {
+        sendResponse({ ok: false, code: "EMPTY_CODE" });
+        return;
+      }
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({
+          ok: false,
+          code: "FORWARD_FAIL",
+          error: e && e.message ? e.message : String(e),
+        });
+      }
     })();
     return true;
   }
