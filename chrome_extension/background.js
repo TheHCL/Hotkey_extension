@@ -392,6 +392,56 @@ function onNativeMessage(_msg) {
   // 原生主機主動推的訊息目前用不到(只 query 與 report_url 都是 client→host)
 }
 
+// --- Cold-start retry helper -----------------------------------------------
+//
+// Chrome MV3 service worker 是 event-driven:SW idle-kill 後第一次被觸發會 spawn 新
+// Python native host process(沒繼承 GUI 那邊的 import cache,完全 cold start)。
+// Python cold start 包含 import pywin32 + Outlook COM proxy 建立,新機器可達 2-5s。
+// Chrome stdin-read timeout 約 5s,Python 還沒讀 stdin 就被殺掉 → port disconnect
+// → 訊息丟失 → user 看到 TIMEOUT / DISCONNECTED。
+//
+// 解法:第一次 sendNative 若拿到 transient failure,主動 disconnect 舊 port、
+// 重新 connectNative、給新 spawn 的 process 一段時間暖機、再 retry 一次。
+// 重點:此 helper 是 cold-start 防護,只對「可能撞 cold start 的訊息」使用
+// (ping / getOtp 等 user 直接操作)。
+//
+// retryWaitMs 不同 caller 用不同值:
+//   ping:300ms(輕量訊息,Python 只要 stdin ready 就能回)
+//   getOtp:1500ms(getOtp 走 fetch_latest_otp 還要載 COM proxy / 翻 stores,
+//     預熱需要更久 — 配合 native_host._warmup_outlook 預熱可縮短)
+//
+// 第二次失敗就照原本 result 回傳(可能是 OUTLOOK_UNAVAILABLE / NO_CODE 等真正的
+// 業務錯誤,也可能仍是 cold start — 但 popup 端 pingWithRetry 也會再用 sendMessage
+// 包一層 retry,給 user 端兜底)。
+async function sendNativeWithColdStartRetry(msg, retryWaitMs) {
+  retryWaitMs = retryWaitMs || 1500;
+  let resp = await sendNative(msg);
+  const transientFailure =
+    resp &&
+    !resp.ok &&
+    (resp.code === "TIMEOUT" ||
+     resp.code === "DISCONNECTED" ||
+     resp.code === "NO_HOST" ||
+     resp.code === "SEND_FAIL");
+  if (transientFailure) {
+    console.log("[pwmgr] sendNative cold-start retry:", msg.type, "first code:", resp.code);
+    if (nativePort) {
+      try { nativePort.disconnect(); } catch (_) {}
+      nativePort = null;
+    }
+    connectNative();
+    // 給新 spawn 的 native host 一點時間讀 stdin(尤其 Python 冷啟動慢)
+    await new Promise((r) => setTimeout(r, retryWaitMs));
+    resp = await sendNative(msg);
+    if (resp && resp.ok) {
+      console.log("[pwmgr] sendNative cold-start retry success:", msg.type);
+    } else {
+      console.log("[pwmgr] sendNative cold-start retry still failing:", msg.type, "second code:", resp && resp.code);
+    }
+  }
+  return resp || { ok: false, code: "EMPTY", error: "native host 沒回應" };
+}
+
 // --- URL 變動觸發 -----------------------------------------------------------
 
 async function onTabUrlChange(tabId, url) {
@@ -583,33 +633,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Ping 是 popup init 第一個呼叫,容易踩到 SW cold start + native host Python
     // 冷啟動(Python import pywin32/keyring 可能 2-5s,Chrome stdin-read timeout
     // 約 5s,過了就會殺掉 native host process → DISCONNECTED)。
-    //
-    // 解法:第一次失敗(TIMEOUT / DISCONNECTED / NO_HOST)就 disconnect 舊 port、
-    // 重新 connectNative、再 retry 一次,給 cold start 多一次機會。
-    // 第二次也失敗才回未連線。
+    // retry 邏輯統一在 sendNativeWithColdStartRetry。
     (async () => {
-      let resp = await sendNative({ type: "ping" });
-      const transientFailure =
-        resp &&
-        !resp.ok &&
-        (resp.code === "TIMEOUT" ||
-         resp.code === "DISCONNECTED" ||
-         resp.code === "NO_HOST" ||
-         resp.code === "SEND_FAIL");
-      if (transientFailure) {
-        console.log("[pwmgr] ping 第一次失敗,重連 native host 再試一次:", resp.code);
-        if (nativePort) {
-          try { nativePort.disconnect(); } catch (_) {}
-          nativePort = null;
-        }
-        connectNative();
-        // 給新 spawn 的 native host 一點時間讀 stdin(尤其 Python 冷啟動慢)
-        await new Promise((r) => setTimeout(r, 300));
-        resp = await sendNative({ type: "ping" });
-        if (resp && resp.ok) {
-          console.log("[pwmgr] ping 重連後成功");
-        }
-      }
+      const resp = await sendNativeWithColdStartRetry({ type: "ping" }, 300);
       sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 沒回應" });
     })();
     return true;
@@ -646,10 +672,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // native host 先看 cache(PWmgr GUI monitor 寫的),miss 才 fallback on-demand 查 Outlook。
     // 拿到 code 後不要直接送 content script(本 background 不該知道 tab 細節);
     // 由 popup 收到 resp 後決定要 forward 給哪個 tab(見 popup.js onOtpClick)。
+    //
+    // 走 sendNativeWithColdStartRetry 因為 getOtp 是 user 主動觸發、容易踩到
+    // SW cold start + Python cold start 的 race condition(getOtp 之前可能沒人 trigger
+    // ping 把 native host 暖起來)。retryWaitMs=1500 配合 native_host._warmup_outlook
+    // 預熱 COM proxy,第一次失敗 disconnect + 重新連 + 等 1.5s 再 retry。
     (async () => {
       try {
         console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP");
-        const resp = await sendNative({ type: "get_otp" });
+        const resp = await sendNativeWithColdStartRetry({ type: "get_otp" }, 1500);
         console.log("[pwmgr] getOtp: native host resp =", resp);
         // 防呆:sendResponse 一定要有 object (Chrome MV3 不接受 undefined 回應)
         sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });

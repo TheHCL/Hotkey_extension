@@ -455,6 +455,20 @@ def _dispatch(req: dict[str, Any]) -> dict[str, Any]:
 
 
 # --- 預熱 --------------------------------------------------------------------
+#
+# 為什麼要預熱:
+# Chrome MV3 service worker 是 event-driven,popup / content 一觸發就 spawn 一個新的
+# native host Python process(沒繼承 GUI 那邊的 import cache,完全 cold start)。
+# cold start 成本主要來自 pywin32 native DLL load + Outlook COM proxy 建立 + session
+# 列舉,新機器可達 2-5 秒。Chrome 對 native message 有 stdin-read timeout(實測約 5s),
+# Python 來不及讀 stdin 就被 Chrome 殺掉 → port disconnect → 訊息丟失。
+#
+# 解法:在 native host 進主迴圈前用 background thread 把這些東西預熱掉。主 thread
+# 第一個訊息進來時,COM proxy 已經建好,只需要 30-100ms 就能回應。background.js 的
+# getOtp handler 仍會有 cold-start retry 當最後保險。
+#
+# _warmup_keyring:預熱 Windows Credential Manager backend(原本就有)
+# _warmup_outlook:預熱 pywin32 + Outlook COM session(這次新增)
 
 
 def _warmup_keyring() -> None:
@@ -475,6 +489,49 @@ def _warmup_keyring() -> None:
         pass
 
 
+def _warmup_outlook() -> None:
+    """背景 thread 預熱 Outlook COM session,把 cold start 成本提前到主迴圈之前。
+
+    跟 outlook_monitor.fetch_latest_otp 走同一條路:
+      1. import pythoncom + win32com(DLL load、COM registration,主要 cold start 成本)
+      2. pythoncom.CoInitialize()(STA — Outlook 需要)
+      3. GetActiveObject → fallback Dispatch 取 Outlook Application proxy
+      4. session.Folders.Count 觸發完整 proxy 鏈(stores list)
+
+    不列 Inbox items(那是 main thread 的事,避免跟 OutlookMonitor 搶)。所有錯誤吞
+    掉 — warmup 失敗不該 crash native host,後續 fetch_latest_otp fallback 還能救,
+    或回 OUTLOOK_UNAVAILABLE 給 caller。
+    """
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+    except Exception:
+        return
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        return
+    try:
+        try:
+            outlook = win32com.client.GetActiveObject("Outlook.Application")
+        except Exception:
+            try:
+                outlook = win32com.client.Dispatch("Outlook.Application")
+            except Exception:
+                return
+        # 觸發完整 proxy 鏈(stores list)
+        try:
+            session = outlook.Session
+            _ = int(session.Folders.Count)
+        except Exception:
+            return
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
 # --- 進入點 ------------------------------------------------------------------
 
 
@@ -482,6 +539,7 @@ def run() -> int:
     """主迴圈:從 stdin 讀、寫 stdout。"""
     # 預熱:在背景 thread 跑,不等它完成
     threading.Thread(target=_warmup_keyring, daemon=True).start()
+    threading.Thread(target=_warmup_outlook, daemon=True).start()
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
