@@ -77,6 +77,21 @@ def main() -> int:
             "error": "mocked in test",
         }
 
+        # 用戶的真實 settings.json 可能把 OTP 關掉(SA 測試環境跟 dev 環境
+        # 共用 %LOCALAPPDATA%),這會讓測試拿到 OTP_DISABLED。覆寫 load_settings
+        # 顯式回 {"otp_enabled": True} 確保測試環境 OTP 是開的(覆蓋 DEFAULT_OTP_ENABLED)。
+        # 同時 mock save_settings 避免污染用戶的 settings.json。
+        import pwmgr.settings as otp_settings_mod
+        _test_target_folder = [None]  # 模擬 OTP folder 的 in-memory state
+        orig_load_settings = otp_settings_mod.load_settings
+        orig_save_settings = otp_settings_mod.save_settings
+        orig_get_target = otp_settings_mod.get_otp_target_folder
+        orig_set_target = otp_settings_mod.set_otp_target_folder
+        otp_settings_mod.load_settings = lambda: {"otp_enabled": True}
+        otp_settings_mod.save_settings = lambda data: None  # 不寫 disk
+        otp_settings_mod.get_otp_target_folder = lambda: _test_target_folder[0]
+        otp_settings_mod.set_otp_target_folder = lambda p: _test_target_folder.__setitem__(0, p)
+
         try:
             # --- Step 1: 模擬 OutlookMonitor 收到 Dell OTP 信 ---
             print("[1] OutlookMonitor 啟動 + ingest 一封假信")
@@ -188,12 +203,169 @@ def main() -> int:
             print(f"    resp: {got}")
             assert got.get("code") == "BAD_REQUEST"
 
+            # --- Step 6: poll_seconds 輪詢 + 第 2 次 fetch 才命中 ---
+            print("\n[6] poll_seconds=1:第 2 次 fetch 才命中 → 走 polling 邏輯")
+            # override mock:前 1 次回 NO_CODE,第 2 次回 ok
+            call_count = {"n": 0}
+            def fake_fetch(**kwargs):
+                call_count["n"] += 1
+                if call_count["n"] >= 2:
+                    return {
+                        "ok": True,
+                        "code": "654321",
+                        "subject": "[External Mail] Dell 一次性密碼",
+                        "received_at": time.time(),
+                        "source": "live",
+                        "folder": "your-email@your-domain.com/Inbox/Dell OTP",
+                    }
+                return {
+                    "ok": False,
+                    "code": "NO_CODE",
+                    "error": "第 1 次還沒收到",
+                }
+            outlook_monitor.fetch_latest_otp = fake_fetch
+
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "get_otp", "poll_seconds": 5, "max_age_seconds": 600})
+            req = native_host._read_message(stdin)
+            resp = native_host._dispatch(req)
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {json.dumps(got, ensure_ascii=False)}")
+            assert got.get("ok") is True, f"應為 ok,得到 {got}"
+            assert got.get("code") == "654321"
+            assert got.get("source") == "live"
+            assert got.get("folder") == "your-email@your-domain.com/Inbox/Dell OTP"
+            assert got.get("attempts") == 2, f"應為 2 次 attempts,得到 {got.get('attempts')}"
+            assert got.get("poll_seconds") == 5
+            assert call_count["n"] == 2, f"fetch 應被呼叫 2 次,得到 {call_count['n']}"
+
+            # --- Step 7: poll_seconds=0 (單次) → 走 cache-first 路徑 ---
+            print("\n[7] poll_seconds=0:單次 → 走 get_latest_otp cache-first")
+            # 先把 cache 寫一筆新的(覆寫 step 6 留下的)
+            m._ingest(
+                "Dell One-time Password",
+                "<html>Your code is <b>112233</b></html>",
+            )
+            outlook_monitor.fetch_latest_otp = lambda **kwargs: {
+                "ok": False,
+                "code": "OUTLOOK_UNAVAILABLE",
+                "error": "fetch 不該被走到(cache 應命中)",
+            }
+
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "get_otp", "poll_seconds": 0})
+            req = native_host._read_message(stdin)
+            resp = native_host._dispatch(req)
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {json.dumps(got, ensure_ascii=False)}")
+            assert got.get("ok") is True
+            assert got.get("code") == "112233"
+            assert got.get("source") == "cache"
+            assert got.get("attempts") == 1
+            assert got.get("poll_seconds") == 0
+
+            # --- Step 8: poll_seconds 防呆:負數 → BAD_REQUEST ---
+            print("\n[8] 防呆:poll_seconds 負數 → BAD_REQUEST")
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "get_otp", "poll_seconds": -1})
+            req = native_host._read_message(stdin)
+            try:
+                resp = native_host._dispatch(req)
+            except native_host.BadRequestError as e:
+                resp = {"ok": False, "code": "BAD_REQUEST", "error": str(e)}
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {got}")
+            assert got.get("code") == "BAD_REQUEST"
+
+            # --- Step 9: target_folder_path 不存在 → OTP_FOLDER_NOT_FOUND ---
+            print("\n[9] target_folder_path 設到不存在的 folder → OTP_FOLDER_NOT_FOUND")
+            # 透過 settings 設一個不存在路徑,然後觸發 polling
+            otp_settings_mod.set_otp_target_folder("your-email@your-domain.com/Inbox/不存在資料夾")
+            outlook_monitor.fetch_latest_otp = lambda **kwargs: {
+                "ok": False,
+                "code": "OTP_FOLDER_NOT_FOUND",
+                "error": "找不到指定的 OTP folder",
+            }
+
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "get_otp", "poll_seconds": 1})
+            req = native_host._read_message(stdin)
+            resp = native_host._dispatch(req)
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {json.dumps(got, ensure_ascii=False)}")
+            assert got.get("ok") is False
+            assert got.get("code") == "OTP_FOLDER_NOT_FOUND"
+            # 清掉設定避免污染其他測試
+            otp_settings_mod.set_otp_target_folder(None)
+
+            # --- Step 10: list_otp_folders dispatch ---
+            print("\n[10] list_otp_folders dispatch(有裝 pywin32 + Outlook → 列真實 folder;沒裝 → PYWIN32_MISSING)")
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "list_otp_folders"})
+            req = native_host._read_message(stdin)
+            resp = native_host._dispatch(req)
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {json.dumps(got, ensure_ascii=False)}")
+            # 兩種結果都接受:
+            #   - 裝了 pywin32 + Outlook 在跑 → 真的列出 folders,ok=True
+            #   - 沒裝 pywin32 → PYWIN32_MISSING,ok=False
+            if got.get("ok"):
+                folders = got.get("folders", [])
+                assert isinstance(folders, list), f"folders 應為 list,得到 {type(folders)}"
+                assert "scan_stats" in got
+                assert "current_folder" in got
+                # folder 格式檢查
+                for f in folders[:5]:
+                    assert "path" in f
+                    assert "name" in f
+                    assert "depth" in f
+                    assert isinstance(f["depth"], int)
+                print(f"    列出 {len(folders)} 個 folder (含真實 Outlook tree)")
+            else:
+                assert got.get("code") == "PYWIN32_MISSING", f"應為 PYWIN32_MISSING,得到 {got.get('code')}"
+
+            # --- Step 11: set_otp_folder round-trip ---
+            print("\n[11] set_otp_folder dispatch(寫入 + 讀回)")
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            write_msg(stdin, {"type": "set_otp_folder", "path": "your-email@your-domain.com/Inbox/Dell OTP"})
+            req = native_host._read_message(stdin)
+            resp = native_host._dispatch(req)
+            native_host._write_message(stdout, resp)
+            stdout.seek(0)
+            got = read_msg(stdout)
+            print(f"    resp: {json.dumps(got, ensure_ascii=False)}")
+            assert got.get("ok") is True
+            assert got.get("path") == "your-email@your-domain.com/Inbox/Dell OTP"
+            assert otp_settings_mod.get_otp_target_folder() == "your-email@your-domain.com/Inbox/Dell OTP"
+            # 清掉
+            otp_settings_mod.set_otp_target_folder(None)
+
             print("\n=== POC 全綠 ===")
             return 0
         finally:
             cfg.otp_cache_path = orig_cfg  # type: ignore[assignment]
             nh_mod.otp_cache_path = orig_nh  # type: ignore[assignment]
             outlook_monitor.fetch_latest_otp = orig_fetch
+            otp_settings_mod.load_settings = orig_load_settings  # type: ignore[assignment]
+            otp_settings_mod.save_settings = orig_save_settings  # type: ignore[assignment]
+            otp_settings_mod.get_otp_target_folder = orig_get_target  # type: ignore[assignment]
+            otp_settings_mod.set_otp_target_folder = orig_set_target  # type: ignore[assignment]
 
 
 if __name__ == "__main__":

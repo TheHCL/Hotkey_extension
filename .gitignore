@@ -39,3 +39,7 @@ credentials*
 
 # Captcha 樣本/Debug 資料:Dell 內網登入頁的截圖,只在本機評測/finetune 用
 ref/
+
+# 一次性 debug / smoke 腳本(SA 臨時驗證用,不要進版控)
+_debug*.py
+smoke_*.py

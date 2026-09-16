@@ -24,6 +24,7 @@ import re
 import struct
 import sys
 import threading
+import time
 from typing import Any
 
 from . import outlook_monitor, storage
@@ -378,9 +379,16 @@ _OTP_MAX_AGE_SECONDS_LIMIT = 3600  # 上限 1 小時,避免 caller 傳怪值
 def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
     """取得最近一封符合 pattern 的 OTP code。
 
+    支援兩種模式(由 ``poll_seconds`` 決定):
+
+    - **單次**(``poll_seconds <= 0`` 或未給):一次 fetch_latest_otp 就回。
+      原本的快取 cache-first 也保留,但 GUI 改成 lazy polling 後幾乎都走這條。
+
+    - **輪詢** (``poll_seconds > 0``):在 user 設定的秒數內,每 2 秒撈一次 Outlook,
+      拿到 code 就 return,timeout 就回 NO_CODE。這是按按鈕才 polling 的實作。
+
     若 user 在 GUI 把 OTP 主開關關掉(otp_enabled=False),直接回 OTP_DISABLED,
-    不開 Outlook COM、不讀 cache。理由:既然 user 明確表示不想被 OTP 機制
-    打擾,就不該偷偷 on-demand 去戳 Outlook(那也會卡)。
+    不開 Outlook COM、不讀 cache。
     """
     try:
         from . import settings as otp_settings
@@ -391,9 +399,10 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
                 "code": "OTP_DISABLED",
                 "error": "OTP 監聽已停用(請到 PWmgr GUI「OTP 監聽設定」啟用)",
             }
+        target_folder = otp_settings.get_otp_target_folder()
     except Exception:
         # settings 讀失敗不擋 — fallback 走原本流程
-        pass
+        target_folder = None
 
     max_age = req.get("max_age_seconds")
     if max_age is None:
@@ -402,28 +411,134 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
         raise BadRequestError("max_age_seconds 必須是正整數")
     max_age = min(max_age, _OTP_MAX_AGE_SECONDS_LIMIT)
 
-    result = outlook_monitor.get_latest_otp(
-        cache_path=otp_cache_path(),
-        subject_patterns=OTP_SUBJECT_PATTERNS,
-        code_regex=OTP_CODE_REGEX,
-        max_age_seconds=max_age,
-        # on-demand fallback 才會用到
-        # (get_latest_otp 內部呼叫 fetch_latest_otp;lookback 透過 OTP_LOOKBACK_COUNT 預設)
-    )
-    # 額外附帶一些 debug 資訊給 popup(不影響 content script 邏輯)
-    if isinstance(result, dict) and result.get("ok"):
+    # 輪詢參數
+    poll_seconds = req.get("poll_seconds")
+    if poll_seconds is None:
+        poll_seconds = 0  # 預設單次
+    if not isinstance(poll_seconds, (int, float)) or poll_seconds < 0:
+        raise BadRequestError("poll_seconds 必須是非負數")
+    # 上限保護 — 避免 user 設超大值卡死 native host
+    poll_seconds = min(float(poll_seconds), float(_OTP_MAX_AGE_SECONDS_LIMIT))
+
+    # 單次模式(poll_seconds == 0)走 cache-first 保留既有行為:
+    # background monitor thread 寫的 cache 可能已經有 code,可以秒回。
+    # 注意:cache-first 路徑不支援 target_folder(背景 monitor thread 也只看 inbox),
+    # 這是預期行為 — 設了 target_folder 的 user 通常是 lazy 模式(背景 monitor 關),
+    # 走 fetch_latest_otp 的 polling 會 honor target_folder。
+    if poll_seconds <= 0:
+        result = outlook_monitor.get_latest_otp(
+            cache_path=otp_cache_path(),
+            subject_patterns=OTP_SUBJECT_PATTERNS,
+            code_regex=OTP_CODE_REGEX,
+            max_age_seconds=max_age,
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            return {
+                "ok": True,
+                "code": str(result.get("code", "")),
+                "subject": str(result.get("subject", "")),
+                "received_at": float(result.get("received_at", 0.0)),
+                "source": str(result.get("source", "")),
+                "folder": str(result.get("folder", "")),
+                "attempts": 1,
+                "poll_seconds": 0,
+            }
+        if isinstance(result, dict):
+            return result
         return {
-            "ok": True,
-            "code": str(result.get("code", "")),
-            "subject": str(result.get("subject", "")),
-            "received_at": float(result.get("received_at", 0.0)),
-            "source": str(result.get("source", "")),
+            "ok": False,
+            "code": "UNKNOWN",
+            "error": "outlook_monitor 回傳格式錯誤",
         }
-    # 失敗也照原樣回(讓前端用 code 欄位判斷錯誤種類)
-    return result if isinstance(result, dict) else {
+
+    # Polling 模式:每 2 秒戳一次 Outlook,honor target_folder_path
+    poll_interval = 2.0
+    deadline = time.monotonic() + poll_seconds
+    attempt = 0
+    last_result: dict[str, Any] | None = None
+
+    while True:
+        attempt += 1
+        result = outlook_monitor.fetch_latest_otp(
+            subject_patterns=OTP_SUBJECT_PATTERNS,
+            code_regex=OTP_CODE_REGEX,
+            max_age_seconds=max_age,
+            target_folder_path=target_folder,
+        )
+        # 命中就 return(成功)
+        if isinstance(result, dict) and result.get("ok"):
+            if attempt > 1:
+                print(f"[pwmgr][otp] poll 命中(第 {attempt} 次,{poll_seconds}s 內)")
+            return {
+                "ok": True,
+                "code": str(result.get("code", "")),
+                "subject": str(result.get("subject", "")),
+                "received_at": float(result.get("received_at", 0.0)),
+                "source": str(result.get("source", "")),
+                "folder": str(result.get("folder", "")),
+                "attempts": attempt,
+                "poll_seconds": poll_seconds,
+            }
+        last_result = result
+        # OTP_FOLDER_NOT_FOUND:立刻 fail,不要再輪(設定錯了,繼續輪沒意義)
+        if isinstance(result, dict) and result.get("code") == "OTP_FOLDER_NOT_FOUND":
+            return result
+        # 已超過 deadline → 跳出
+        if time.monotonic() >= deadline:
+            break
+        # 否則 sleep 後再撈
+        time.sleep(poll_interval)
+
+    # 全部失敗,回最後一次的結果(讓 caller 看得到原因)
+    if isinstance(last_result, dict):
+        last_result["attempts"] = attempt
+        last_result["poll_seconds"] = poll_seconds
+        return last_result
+    return {
         "ok": False,
         "code": "UNKNOWN",
         "error": "outlook_monitor 回傳格式錯誤",
+    }
+
+
+def _handle_list_otp_folders(req: dict[str, Any]) -> dict[str, Any]:
+    """列出 Outlook 內可選的 OTP target folder candidates(給 GUI 顯示)。
+
+    回傳格式見 ``outlook_monitor.list_otp_candidate_folders``,
+    並附加 ``current_folder``(user 目前設定的 folder path,可能是 None)。
+    """
+    max_depth = req.get("max_depth")
+    if max_depth is None:
+        max_depth = 2
+    if not isinstance(max_depth, int) or max_depth < 0 or max_depth > 5:
+        raise BadRequestError("max_depth 必須是 0-5 的整數")
+    result = outlook_monitor.list_otp_candidate_folders(max_depth=max_depth)
+    try:
+        from . import settings as otp_settings
+        if isinstance(result, dict):
+            result["current_folder"] = otp_settings.get_otp_target_folder()
+    except Exception:
+        # settings 讀失敗不擋 listing
+        if isinstance(result, dict):
+            result["current_folder"] = None
+    return result
+
+
+def _handle_set_otp_folder(req: dict[str, Any]) -> dict[str, Any]:
+    """寫 OTP target folder 到 settings。path 是 None 或空字串就清掉。
+
+    用於 GUI 設完 folder 後,extension 把選擇送到 native host 落地。
+    直接走 settings 模組寫,不用重啟 GUI。
+    """
+    from . import settings as otp_settings
+
+    path = req.get("path")
+    if path is not None and not isinstance(path, str):
+        raise BadRequestError("path 必須是 string 或 null")
+    otp_settings.set_otp_target_folder(path if isinstance(path, str) else None)
+    return {
+        "ok": True,
+        "path": otp_settings.get_otp_target_folder(),
     }
 
 
@@ -439,6 +554,8 @@ _DISPATCH: dict[str, Any] = {
     "set_group_color": _handle_set_group_color,
     "solve_captcha": _handle_solve_captcha,
     "get_otp": _handle_get_otp,
+    "list_otp_folders": _handle_list_otp_folders,
+    "set_otp_folder": _handle_set_otp_folder,
 }
 
 

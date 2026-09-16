@@ -9,6 +9,8 @@ const BADGE_COLOR = "#0078d4";
 const PENDING_FILL_TTL_MS = 30000;
 const LAUNCH_FILL_TABS_KEY = "launchFillTabs"; // 用 storage.local 跨 SW 重啟保留
 const PENDING_FILL_KEY = "pendingFill"; // storage.local key,跨 SW 重啟保留 credentials
+// login trigger 站台獨立 slot,不被 regular claimPendingFill 誤砍
+const LOGIN_TRIGGER_TTL_MS = 60000;
 
 let nativePort = null;
 let lastTabUrl = null;   // 上次主動查詢的 URL(避免重複 query)
@@ -247,6 +249,8 @@ async function otpFillFnExecutedScript(code) {
   }
   return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
 }
+// 各 tabId 的 loginTriggerPending 自動清除 timer(service worker 重啟會掉,
+let loginTriggerTimers = {}; // tabId -> setTimeout handle
 
 // --- 原生主機連線管理 -------------------------------------------------------
 
@@ -669,29 +673,69 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === "getOtp") {
     // popup 觸發:user 按「取得驗證碼」按鈕 → 跟 native host 要最近一筆 OTP code。
-    // native host 先看 cache(PWmgr GUI monitor 寫的),miss 才 fallback on-demand 查 Outlook。
     // 拿到 code 後不要直接送 content script(本 background 不該知道 tab 細節);
     // 由 popup 收到 resp 後決定要 forward 給哪個 tab(見 popup.js onOtpClick)。
     //
+    // 支援兩種輪詢模式(poll_seconds):
+    //   - 0 / 沒給:單次 lookup(原本行為,user 已經按過按鈕但信可能還在路上)
+    //   - >0:lazy polling — native host 在 poll_seconds 秒內每 2 秒撈一次 Outlook,
+    //         拿到 code 就 return,timeout 就回 NO_CODE。這是「按按鈕才 polling」的實作。
+    //
     // 走 sendNativeWithColdStartRetry 因為 getOtp 是 user 主動觸發、容易踩到
-    // SW cold start + Python cold start 的 race condition(getOtp 之前可能沒人 trigger
-    // ping 把 native host 暖起來)。retryWaitMs=1500 配合 native_host._warmup_outlook
-    // 預熱 COM proxy,第一次失敗 disconnect + 重新連 + 等 1.5s 再 retry。
+    // SW cold start + Python cold start 的 race condition。
+    // 重要:走 retry 不能跟 poll_seconds 同時用 — 會把 poll 時間 double。所以只有
+    // poll_seconds=0 才走 retry helper,有 poll_seconds 直接 sendNative(python 那邊
+    // 自己會輪詢 + retry)。
+    const pollSeconds = typeof msg.pollSeconds === "number" && msg.pollSeconds > 0
+      ? msg.pollSeconds
+      : 0;
     (async () => {
       try {
-        console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP");
-        const resp = await sendNativeWithColdStartRetry({ type: "get_otp" }, 1500);
+        console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP (poll=" + pollSeconds + "s)");
+        const req = { type: "get_otp" };
+        if (pollSeconds > 0) req.poll_seconds = pollSeconds;
+        const resp = pollSeconds > 0
+          ? await sendNative(req)
+          : await sendNativeWithColdStartRetry(req, 1500);
         console.log("[pwmgr] getOtp: native host resp =", resp);
-        // 防呆:sendResponse 一定要有 object (Chrome MV3 不接受 undefined 回應)
         sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });
       } catch (e) {
         console.warn("[pwmgr] getOtp handler 拋例外:", e && e.message || e);
-        // 即使內部 throw 也要 sendResponse,否則 popup 會等滿 5 秒 timeout 拿 undefined
         try {
           sendResponse({ ok: false, code: "EXCEPTION", error: String(e && e.message || e) });
         } catch (_) {
           // channel 可能已關,沒辦法
         }
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "listOtpFolders") {
+    // popup 「OTP folder 設定」UI 用:列出可選的 Outlook folders。
+    (async () => {
+      try {
+        const resp = await sendNativeWithColdStartRetry({ type: "list_otp_folders" }, 1500);
+        sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });
+      } catch (e) {
+        try {
+          sendResponse({ ok: false, code: "EXCEPTION", error: String(e && e.message || e) });
+        } catch (_) {}
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "setOtpFolder") {
+    // popup 設完 OTP folder 後送到 native host 落地存 settings.json。
+    (async () => {
+      try {
+        const resp = await sendNative({ type: "set_otp_folder", path: msg.path });
+        sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });
+      } catch (e) {
+        try {
+          sendResponse({ ok: false, code: "EXCEPTION", error: String(e && e.message || e) });
+        } catch (_) {}
       }
     })();
     return true;
@@ -776,6 +820,79 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, code: "TAB_CREATE_FAIL", error: String(e) });
       }
     })();
+    return true;
+  }
+
+  if (msg.type === "setupLoginTrigger") {
+    // content script 在 Dell SSO landing 頁(testvault/boss.dell.com)準備點
+    // login 按鈕前呼叫,把帳密暫存成 loginTriggerPending。
+    //
+    // ⚠ 為什麼不用 regular pendingFill slot?
+    // launchAndFill 流程會在 create tab 之前就先 setPendingFill。tab 載入後
+    // content script 200ms 的 claimPendingFill timer 會搶先撈掉 regular
+    // pendingFill,造成 SSO 跳轉後的新 content script 撈不到 → 不會填。
+    // 解法:獨立 slot loginTriggerPending,跟 regular 完全隔離,兩個 claim
+    // 都跑,誰有資料用誰。
+    const senderTabId = _sender && _sender.tab && _sender.tab.id;
+    if (!senderTabId) {
+      sendResponse({ ok: false, code: "NO_TAB_ID" });
+      return false;
+    }
+    const creds = {
+      tabId: senderTabId,
+      username: String(msg.username || ""),
+      password: String(msg.password || ""),
+      url: String(msg.url || ""),
+    };
+    chrome.storage.session.set({ loginTriggerPending: creds }).catch(function (e) {
+      console.warn("[pwmgr] loginTriggerPending.set failed", e && e.message || e);
+    });
+    // 60s TTL 自動清:避免 SSO 卡住時 stale credential 永遠留著被誤填。
+    // 用 in-memory timer 對齊 set 內容(若期間被 overwrite,舊 timer 失效)。
+    if (loginTriggerTimers[senderTabId]) clearTimeout(loginTriggerTimers[senderTabId]);
+    loginTriggerTimers[senderTabId] = setTimeout(function () {
+      chrome.storage.session.remove("loginTriggerPending", function () {
+        // best-effort 清掉,失敗也無妨
+      });
+      delete loginTriggerTimers[senderTabId];
+    }, LOGIN_TRIGGER_TTL_MS);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === "claimLoginTrigger") {
+    // SSO 跳轉後的新 content script 主動 claim。tabId 對得到才回。
+    const senderTabId = _sender && _sender.tab && _sender.tab.id;
+    chrome.storage.session.get("loginTriggerPending", function (data) {
+      const p = data && data.loginTriggerPending;
+      if (!p || p.tabId !== senderTabId) {
+        sendResponse({ ok: false, code: "NO_PENDING" });
+        return;
+      }
+      chrome.storage.session.remove("loginTriggerPending");
+      if (loginTriggerTimers[senderTabId]) {
+        clearTimeout(loginTriggerTimers[senderTabId]);
+        delete loginTriggerTimers[senderTabId];
+      }
+      sendResponse({ ok: true, username: p.username, password: p.password, url: p.url });
+    });
+    return true;
+  }
+
+  if (msg.type === "cancelLoginTrigger") {
+    // content script 點完 login 按鈕後,如果 URL 沒變(同頁 modal),不需要
+    // 留著 loginTriggerPending,清掉避免下一頁誤填。同時也清 regular pendingFill
+    // 作為保險。
+    const senderTabId = _sender && _sender.tab && _sender.tab.id;
+    if (senderTabId) {
+      clearPendingFill(senderTabId);
+      chrome.storage.session.remove("loginTriggerPending");
+      if (loginTriggerTimers[senderTabId]) {
+        clearTimeout(loginTriggerTimers[senderTabId]);
+        delete loginTriggerTimers[senderTabId];
+      }
+    }
+    sendResponse({ ok: true });
     return true;
   }
 

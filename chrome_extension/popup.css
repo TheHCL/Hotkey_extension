@@ -256,3 +256,6 @@ footer {
   background: #ccc;
   cursor: not-allowed;
 }
+
+/* OTP folder picker 已搬到 PWmgr GUI 的「OTP 監聽設定」dialog,
+   popup 不再做 picker UI,相關 modal/row 樣式不再需要。 */

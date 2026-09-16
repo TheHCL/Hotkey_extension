@@ -635,18 +635,25 @@ def fetch_latest_otp(
     code_regex: str = DEFAULT_CODE_REGEX,
     max_age_seconds: int = 600,
     lookback_count: int = 10,
+    target_folder_path: str | None = None,
 ) -> dict[str, Any]:
-    """直接開 Outlook COM,翻 Inbox 找最近符合的 OTP 信並抽 code。
+    """直接開 Outlook COM,翻 folder 找最近符合的 OTP 信並抽 code。
 
     設計目標:**5-15 秒內完成**。Exchange mailbox Items 枚舉走網路,
     一次 round-trip 數十~數百 ms;Restrict/Sort 都是網路 call,直接拿掉。
 
     COM 連線:GetActiveObject → fallback Dispatch。
     搜尋策略:
-      1. 優先 ``Daniel_Hsieh@compal.com`` Exchange mailbox 的 Inbox(信第一時間落這)
-      2. 再看 ``Outlook`` store 的 Inbox(server rule 把信搬到這需要 sync 延遲)
-      3. 其他 store 看時間還有就順便翻
-      4. Junk 不翻(預設信在 Inbox)
+      1. 若 ``target_folder_path`` 有給(user 在 GUI 指定的 folder)→ 只掃那個 folder
+      2. 否則走預設:每個 store 的 Inbox(Exchange mailbox 排前)
+
+    為什麼要支援 target_folder_path:
+      Outlook rule 可能把 Dell OTP 信搬到自訂資料夾(例如「Inbox/Dell OTP」)。
+      不支援的話,inbox 看不到信 → user 怎麼按按鈕都 NO_CODE。
+
+    COM release:
+      用 try/finally 包 CoUninitialize,函式 return 後 COM handle 一定釋放。
+      對 user 來說「按按鈕 → poll → 拿到 code → Outlook 不會卡」是基本要求。
     """
     if not _HAS_PYWIN32:
         return {"ok": False, "code": "PYWIN32_MISSING", "error": "pywin32 未安裝"}
@@ -655,10 +662,11 @@ def fetch_latest_otp(
     subject_res = [re.compile(p, re.IGNORECASE) for p in raw_patterns]
     code_re = re.compile(code_regex)
     cutoff = time.time() - max_age_seconds
-    inboxes: list[tuple[str, Any]] = []  # 順序:Exchange mailbox → Outlook profile → 其他
+    targets: list[tuple[str, Any]] = []  # (label, folder) — 走訪清單
     scan_stats: list[str] = []
 
     co_initialized_here = False
+    outlook = None
     try:
         try:
             pythoncom.CoInitialize()
@@ -670,45 +678,65 @@ def fetch_latest_otp(
             outlook = _get_outlook_app()
             session = outlook.Session
 
-            # 走所有 store,把 Inbox 加到 inboxes(Exchange mailbox 排前面)
-            try:
-                stores = session.Folders
-                store_count = int(stores.Count)
-                scan_stats.append(f"找到 {store_count} 個 store")
-                for i in range(store_count):
-                    store = stores.Item(i + 1)
-                    sname = str(store.Name or "")
-                    inbox = _find_subfolder(store, ("Inbox", "收件匣", "收件箱"))
-                    if inbox is None:
-                        scan_stats.append(f"[{sname}] 無 Inbox")
-                        continue
-                    try:
-                        n = int(inbox.Items.Count)
-                    except Exception:
-                        n = -1
-                    scan_stats.append(f"[{sname}] Inbox={n}")
-                    # Exchange mailbox 排最前 — 信第一時間到這;Outlook profile 排第二(rule 搬運目的地)
-                    if "@" in sname:
-                        inboxes.insert(0, (f"{sname}/Inbox", inbox))
-                    else:
-                        inboxes.append((f"{sname}/Inbox", inbox))
-            except Exception as e:
-                scan_stats.append(f"walk stores 失敗:{e}")
+            # 路徑 A:user 指定 folder → 只掃那一個
+            if target_folder_path:
+                folder = _find_folder_by_path(session, target_folder_path)
+                if folder is None:
+                    return {
+                        "ok": False,
+                        "code": "OTP_FOLDER_NOT_FOUND",
+                        "error": f"找不到指定的 OTP folder: {target_folder_path}",
+                    }
+                try:
+                    n = int(folder.Items.Count)
+                except Exception:
+                    n = -1
+                scan_stats.append(f"[{target_folder_path}]={n}")
+                targets.append((target_folder_path, folder))
+            else:
+                # 路徑 B:預設 — 走所有 store,把 Inbox 加到 targets
+                try:
+                    stores = session.Folders
+                    store_count = int(stores.Count)
+                    scan_stats.append(f"找到 {store_count} 個 store")
+                    for i in range(store_count):
+                        store = stores.Item(i + 1)
+                        sname = str(store.Name or "")
+                        inbox = _find_subfolder(store, ("Inbox", "收件匣", "收件箱"))
+                        if inbox is None:
+                            scan_stats.append(f"[{sname}] 無 Inbox")
+                            continue
+                        try:
+                            n = int(inbox.Items.Count)
+                        except Exception:
+                            n = -1
+                        scan_stats.append(f"[{sname}] Inbox={n}")
+                        if "@" in sname:
+                            targets.insert(0, (f"{sname}/Inbox", inbox))
+                        else:
+                            targets.append((f"{sname}/Inbox", inbox))
+                except Exception as e:
+                    scan_stats.append(f"walk stores 失敗:{e}")
 
-            # 完全 walk 失敗時的 fallback
-            if not inboxes:
-                fb = _safe_get_folder(session, _OL_FOLDER_INBOX)
-                if fb is not None:
-                    inboxes.append(("default/Inbox", fb))
+                if not targets:
+                    fb = _safe_get_folder(session, _OL_FOLDER_INBOX)
+                    if fb is not None:
+                        targets.append(("default/Inbox", fb))
 
             recent_subjects: list[str] = []
-            for folder_label, folder in inboxes:
+            # 收集所有符合的 OTP 信,最後按 ReceivedTime 倒序取最新那封。
+            # 原因:Outlook COM Items 預設順序不保證 desc by ReceivedTime
+            # (Exchange 信箱甚至可能按 EntryID 或其他 key);如果直接拿第一個
+            # 符合的,可能拿到的是較舊的信,user 就會看到「按按鈕抓的都是上一次的」。
+            # 不呼叫 items.Sort 因為 Exchange 信箱 Sort 是網路 round-trip,
+            # 大信箱下會 timeout;改成在 Python 內 sort。
+            matches: list[dict[str, Any]] = []
+            for folder_label, folder in targets:
                 try:
                     items = folder.Items
                 except Exception as e:
                     scan_stats.append(f"[{folder_label}] 取 Items 失敗:{e}")
                     continue
-                # 不 Restrict / 不 Sort — 網路 call 太多會 timeout;ReceivedTime 自己比對
                 checked = 0
                 for item in items:
                     if checked >= lookback_count:
@@ -732,25 +760,35 @@ def fetch_latest_otp(
                         m = code_re.search(plain)
                         if not m:
                             continue
-                        return {
+                        matches.append({
                             "ok": True,
                             "code": m.group(1),
                             "subject": subj,
                             "received_at": recv_ts,
                             "source": "live",
-                        }
+                            "folder": folder_label,
+                        })
                     except Exception:
                         continue
+            if matches:
+                # 倒序:最新在前。同一個 max_age 內可能有多封(例如 user 連按多次
+                # 「請求 OTP」觸發 Dell 寄多封信),拿最新那封才是 user 現在要用的。
+                matches.sort(key=lambda m: m["received_at"], reverse=True)
+                return matches[0]
             return {
                 "ok": False,
                 "code": "NO_CODE",
                 "error": (
-                    f"最近 {max_age_seconds}s 內 {len(inboxes)} 個 store 的 Inbox 找不到符合的信。"
+                    f"最近 {max_age_seconds}s 內 {len(targets)} 個 folder 找不到符合的信。"
                     f"scan 摘要:{' | '.join(scan_stats)}。"
                     f"subject 樣本:{recent_subjects[:5] if recent_subjects else '(沒收到信)'}"
                 ),
             }
         finally:
+            # 顯式 drop COM reference,讓 pywin32 早點 release。
+            # Outlook instance 是 GetActiveObject 拿到的(共用在 user 開的 Outlook),
+            # Dispatch 出來的才會自己關;但 folder / items reference drop 還是有幫助。
+            outlook = None
             if co_initialized_here:
                 try:
                     pythoncom.CoUninitialize()
@@ -806,6 +844,197 @@ def _find_subfolder(parent, names: tuple[str, ...]):
     return None
 
 
+def _find_folder_by_path(session, path: str):
+    """在 Outlook session 內,根據 `store/sub1/sub2/...` 路徑找 folder。
+
+    路徑第一段是 store 名稱(對應 ``session.Folders.Item`` 名稱);
+    後續每段用 `/` 分隔,逐層找。
+
+    多語系處理 — 重要:
+      - 第二段(parent = store):用 ``_find_subfolder`` 配多語系 tuple。
+        中文版 Outlook 的 Inbox 是「收件匣」,用純 name 比對會 fail。
+        跟 ``list_otp_candidate_folders`` / ``_collect_watch_collections`` 用的一致。
+      - 第三段以後(parent = user folder):直接 ``_find_subfolder(folder, (name,))``。
+        因為第三段後的名字本來就是從 inbox.Folders.Item 拿出來的真實名稱,
+        list_otp_candidate_folders 已經把路徑組好存 settings,所以純比對就對。
+
+    早期實作曾用 ``store.GetDefaultFolder(id)`` 試圖自動解析,但實測
+    ``session.Folders.Item(i+1)`` 拿到的是 ``MAPIFolder`` 物件(不是
+    ``Outlook.Store``),沒有 ``GetDefaultFolder`` 方法 → 直接 throw。
+    改走跟 list_otp_candidate_folders 一樣的 ``_find_subfolder`` 多語系 tuple。
+
+    找不到中間任何一層就回 None(不 raise)— caller 拿到 None 可以回
+    OTP_FOLDER_NOT_FOUND 給 user,而不會 crash 整個 native host。
+
+    跟 ``list_otp_candidate_folders`` 配對使用:UI 先列 candidates,user
+    選一個後把 path 存到 settings,on-demand lookup 走這條路徑解析。
+    """
+    if not session or not path or not isinstance(path, str):
+        return None
+    parts = [p.strip() for p in path.split("/") if p.strip()]
+    if not parts:
+        return None
+    # 第一段:store 名稱
+    try:
+        stores = session.Folders
+        store_count = int(stores.Count)
+    except Exception:
+        return None
+    store = None
+    for i in range(store_count):
+        try:
+            s = stores.Item(i + 1)
+            if str(s.Name or "") == parts[0]:
+                store = s
+                break
+        except Exception:
+            continue
+    if store is None:
+        return None
+    # 第二段:用多語系 tuple 找(中文版 Outlook 的 Inbox 是「收件匣」)
+    # 跟 list_otp_candidate_folders / _collect_watch_collections 一樣
+    folder = _find_subfolder(store, ("Inbox", "收件匣", "收件箱"))
+    if folder is None:
+        return None
+    # 第三段以後:parent 是 user folder,直接用 name 比對
+    for name in parts[2:]:
+        folder = _find_subfolder(folder, (name,))
+        if folder is None:
+            return None
+    return folder
+
+
+def list_otp_candidate_folders(
+    max_depth: int = 2,
+    max_per_level: int = 30,
+) -> dict[str, Any]:
+    """列出可選的 OTP target folder candidates(給 GUI 顯示用)。
+
+    走所有 store,列舉 Inbox + 底下最多 ``max_depth`` 層的 subfolders(預設 2 層)。
+    跳過明顯跟 OTP 無關的系統 folder(草稿 / 寄件備份 / 垃圾桶 / Junk)避免清單太長。
+
+    回傳格式::
+        {
+          "ok": True,
+          "folders": [
+            {"path": "your-email@your-domain.com/Inbox", "name": "Inbox", "depth": 0},
+            {"path": "your-email@your-domain.com/Inbox/Dell OTP", "name": "Dell OTP", "depth": 1},
+            ...
+          ],
+          "scan_stats": ["找到 2 個 store", ...],
+        }
+    """
+    if not _HAS_PYWIN32:
+        return {"ok": False, "code": "PYWIN32_MISSING", "error": "pywin32 未安裝"}
+    out: list[dict[str, Any]] = []
+    scan_stats: list[str] = []
+    # 跳過這些系統 folder 名稱(不分大小寫)— user 不會想把 OTP 監聽設在這
+    _SKIP_NAMES = {
+        "drafts", "draft", "草稿",
+        "sent items", "sent", "寄件備份", "已传送邮件", "已傳送郵件",
+        "deleted items", "trash", "垃圾桶", "刪除的邮件", "刪除的郵件",
+        "junk", "junk email", "垃圾邮件", "垃圾郵件", "垃圾信件",
+        "outbox", "寄件匣", "寄件箱",
+        "notes", "備忘稿", "便签", "便箋",
+        "journal", "日誌",
+        "contacts", "連絡人", "联系人", "聯絡人",
+        "calendar", "行事曆", "日历", "日曆",
+        "tasks", "工作", "任务", "工作",
+        "rss feeds", "rss 摘要", "rss 源",
+    }
+    co_initialized_here = False
+    try:
+        try:
+            pythoncom.CoInitialize()
+            co_initialized_here = True
+        except Exception:
+            pass
+        outlook = _get_outlook_app()
+        session = outlook.Session
+
+        def _walk(parent, prefix: str, current_depth: int):
+            try:
+                count = int(parent.Folders.Count)
+            except Exception:
+                return
+            for j in range(count):
+                if len(out) >= max_per_level * (max_depth + 1) * 4:
+                    return
+                try:
+                    sub = parent.Folders.Item(j + 1)
+                    sub_name = str(sub.Name or "")
+                    if not sub_name:
+                        continue
+                    full_path = f"{prefix}/{sub_name}" if prefix else sub_name
+                    # 加進清單(不算 skip — user 可以看到完整 tree 自己選)
+                    out.append({"path": full_path, "name": sub_name, "depth": current_depth})
+                    # 遞迴(到 max_depth 停)
+                    if current_depth < max_depth:
+                        if sub_name.lower() not in _SKIP_NAMES:
+                            _walk(sub, full_path, current_depth + 1)
+                except Exception:
+                    continue
+
+        try:
+            stores = session.Folders
+            store_count = int(stores.Count)
+            scan_stats.append(f"找到 {store_count} 個 store")
+            for i in range(store_count):
+                try:
+                    store = stores.Item(i + 1)
+                    sname = str(store.Name or "")
+                    if not sname:
+                        continue
+                    out.append({"path": sname, "name": sname, "depth": 0})
+                    inbox = _find_subfolder(store, ("Inbox", "收件匣", "收件箱"))
+                    if inbox is not None:
+                        # Inbox 自己加進去
+                        out.append({
+                            "path": f"{sname}/Inbox",
+                            "name": "Inbox",
+                            "depth": 1,
+                        })
+                        # 走 Inbox 底下第一層(略過 skip 的)
+                        try:
+                            ic = int(inbox.Folders.Count)
+                        except Exception:
+                            ic = 0
+                            inbox = None  # type: ignore[assignment]
+                        if inbox is not None:
+                            for j in range(ic):
+                                if len(out) >= 200:
+                                    break
+                                try:
+                                    sub = inbox.Folders.Item(j + 1)
+                                    sub_name = str(sub.Name or "")
+                                    if not sub_name or sub_name.lower() in _SKIP_NAMES:
+                                        continue
+                                    out.append({
+                                        "path": f"{sname}/Inbox/{sub_name}",
+                                        "name": sub_name,
+                                        "depth": 2,
+                                    })
+                                except Exception:
+                                    continue
+                except Exception:
+                    continue
+        except Exception as e:
+            scan_stats.append(f"walk stores 失敗:{e}")
+        return {"ok": True, "folders": out, "scan_stats": scan_stats}
+    except Exception as e:
+        return {
+            "ok": False,
+            "code": "OUTLOOK_UNAVAILABLE",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if co_initialized_here:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
 def _safe_get_folder_in_store(store, folder_id: int):
     """在特定 store 內取 default folder by id;不存在或無權限就 return None。"""
     if store is None:
@@ -820,7 +1049,7 @@ def _collect_watch_collections(session) -> list[tuple[str, Any]]:
     """Walk 所有 store,收集 (label, Items) 給 monitor 用。
 
     每個 store 找 Inbox(支援多語系 folder 名稱) + Junk(若存在)。
-    回傳 [(label, items), ...],label 形如 "Daniel_Hsieh@compal.com/Inbox"。
+    回傳 [(label, items), ...],label 形如 "your-email@your-domain.com/Inbox"。
     """
     out: list[tuple[str, Any]] = []
     if session is None:

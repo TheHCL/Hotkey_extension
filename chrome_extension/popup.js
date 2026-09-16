@@ -20,6 +20,10 @@ const $otpBtn = document.getElementById("otp-btn");
 $captchaBtn.addEventListener("click", onCaptchaClick);
 $otpBtn.addEventListener("click", onOtpClick);
 
+// OTP polling 設定
+const OTP_POLL_SECONDS = 15; // 按按鈕後最多等 15 秒
+const OTP_POLL_TICK_MS = 1000; // 倒數 UI 更新頻率
+
 let currentTabId = null;
 let currentUrl = null;
 let allLaunches = []; // fallback 模式快取,搜尋時即時過濾
@@ -270,20 +274,34 @@ async function onOtpClick() {
   console.log("[pwmgr][popup] onOtpClick start, currentTabId=", currentTabId);
   $otpBtn.disabled = true;
   const orig = $otpBtn.textContent;
-  $otpBtn.textContent = "取得中…";
+  // 倒數 UI:每 1 秒更新按鈕文字(例「取得中… (14s)」)
+  let remaining = OTP_POLL_SECONDS;
+  $otpBtn.textContent = `取得中… (${remaining}s)`;
+  const tickId = setInterval(() => {
+    remaining -= 1;
+    if (remaining < 0) remaining = 0;
+    $otpBtn.textContent = `取得中… (${remaining}s)`;
+  }, OTP_POLL_TICK_MS);
   try {
-    // 1. 跟 native host 要 code
-    const otpResp = await chrome.runtime.sendMessage({ type: "getOtp" });
+    // 1. 跟 native host 要 code(pollSeconds 讓 native host 在這段時間內輪詢)
+    const otpResp = await chrome.runtime.sendMessage({
+      type: "getOtp",
+      pollSeconds: OTP_POLL_SECONDS,
+    });
     console.log("[pwmgr][popup] getOtp resp:", otpResp);
     if (!otpResp || !otpResp.ok) {
       // 常見錯誤:
       //   NO_CODE → outlook 還沒收到信 / 範圍內沒符合
       //   OUTLOOK_UNAVAILABLE → pywin32 沒裝 / Outlook 沒在跑
       //   PYWIN32_MISSING → requirements 漏裝
+      //   OTP_FOLDER_NOT_FOUND → GUI 設的 folder 路徑錯了
       const code = (otpResp && otpResp.code) || "EMPTY";
       const err = (otpResp && otpResp.error) || "";
       if (code === "NO_CODE") {
-        setStatus("Outlook 還沒收到驗證碼信,稍候再試");
+        const attempts = otpResp.attempts || 1;
+        setStatus(`OTP ${OTP_POLL_SECONDS}s 內沒找到(輪 ${attempts} 次),請到 PWmgr GUI「OTP 監聽設定」確認 folder 是否正確`);
+      } else if (code === "OTP_FOLDER_NOT_FOUND") {
+        setStatus(`OTP folder 設錯了:${err} — 請到 PWmgr GUI「OTP 監聽設定」重設`);
       } else if (code === "OUTLOOK_UNAVAILABLE" || code === "PYWIN32_MISSING") {
         setStatus(`Outlook 無法使用(${err}),請確認 Outlook 已開 + PWmgr 常駐`);
       } else if (code === "OTP_DISABLED") {
@@ -316,7 +334,8 @@ async function onOtpClick() {
           ? `(${Math.max(0, Math.round(Date.now() / 1000 - otpResp.received_at))}秒前收到)`
           : "";
       const srcStr = otpResp.source === "cache" ? "cache" : "live";
-      setStatus(`已填入 ${code}${ageStr} [${srcStr}] — 按 Enter 送出`);
+      const folderStr = otpResp.folder ? ` [${otpResp.folder}]` : "";
+      setStatus(`已填入 ${code}${ageStr} [${srcStr}]${folderStr} — 按 Enter 送出`);
     } else if (fillResp && fillResp.code === "NOT_FOUND") {
       setStatus("頁面已變動,找不到 OTP 輸入框(請重新整理)");
     } else if (fillResp && fillResp.code === "FILL_NOOP") {
@@ -330,10 +349,16 @@ async function onOtpClick() {
     console.warn("[pwmgr][popup] onOtpClick threw:", e);
     setStatus(`例外:${(e && e.message) || e}`);
   } finally {
+    clearInterval(tickId);
     $otpBtn.disabled = false;
     $otpBtn.textContent = orig;
   }
 }
+
+// --- OTP folder picker 已搬到 PWmgr GUI 的「OTP 監聽設定」dialog ---
+// (popup.js 不再做 picker UI。background.js 的 listOtpFolders / setOtpFolder
+//  handler 也不再需要,但保留 dispatch entry 避免 native host 端 dispatch table
+//  對不上 — 兩端都標 deprecate,後續版本可移除。)
 
 function renderAutofillList(matches) {
   $matches.innerHTML = "";

@@ -1201,8 +1201,10 @@ class PwmgrApp:
         except tk.TclError:
             pass
         # 加大預設尺寸 + minsize,避免高 DPI / 多 store 時 listbox 把底部按鈕擠出畫面。
-        dlg.geometry("520x520")
-        dlg.minsize(440, 440)
+        # 加 OTP folder section 後,原本的 520x520 不夠放所有內容(store list +
+        # folder picker entry + 儲存按鈕),放大到 560x640。
+        dlg.geometry("560x640")
+        dlg.minsize(480, 520)
 
         # 三段式 layout: top(標題+說明) / middle(模式+listbox,可擴展) / bottom(狀態+按鈕,永遠在最下)
         # 用 pack(side=TOP/BOTTOM/expand) 各管一段,避免單一 body 內 listbox expand 吃掉底部空間。
@@ -1336,6 +1338,41 @@ class PwmgrApp:
         bottom = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 4, 18, 14))
         bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 14))
 
+        # --- OTP 監聽 folder(Outlook rule 搬信場景) -------------------------------
+        # Outlook rule 可能把 Dell OTP 信搬到自訂資料夾(例 /Inbox/otp)。
+        # 沒指定就用每個 store 的 Inbox(原本行為)。
+        # 設計:path 用 StringVar 顯示目前設定,「📁 選擇 folder...」按鈕開 child dialog
+        # 列出 Outlook folder tree,雙擊/確認後寫回。None 或空字串 = 自動 Inbox。
+        folder_frame = ttk.Frame(middle, style="Card.TFrame")
+        folder_frame.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(
+            folder_frame,
+            text="OTP 監聽 folder(Outlook rule 搬信時指定):",
+            style="CardMuted.TLabel",
+        ).pack(anchor=tk.W)
+        folder_row = ttk.Frame(folder_frame, style="Card.TFrame")
+        folder_row.pack(fill=tk.X, pady=(4, 0))
+        # 用 StringVar 顯示;空字串 = 未設定(走預設 Inbox)
+        folder_path_var = tk.StringVar(value=otp_settings.get_otp_target_folder() or "")
+        folder_entry = ttk.Entry(
+            folder_row, textvariable=folder_path_var, state="readonly", font=FONT_BASE,
+        )
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def _open_folder_picker() -> None:
+            current = folder_path_var.get().strip()
+            picked = self._open_otp_folder_picker(dlg, current_path=current or None)
+            if picked is not None:
+                # 允許用 picker 清掉(回空字串)→ 走預設 Inbox
+                folder_path_var.set(picked)
+
+        ttk.Button(
+            folder_row, text="📁 選擇 folder...", command=_open_folder_picker,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            folder_row, text="清除", command=lambda: folder_path_var.set(""),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
         status_lbl = ttk.Label(bottom, text="", style="CardMuted.TLabel", wraplength=460)
         status_lbl.pack(anchor=tk.W)
         if detection_error:
@@ -1355,9 +1392,14 @@ class PwmgrApp:
             else:
                 # 關閉 OTP 時不變更 store 設定(保留 user 已選的清單,開啟時直接用)
                 new_setting = otp_settings.get_otp_subscribed_stores()
+            # Folder 設定(跟 master enable 無關 — 即使關閉 OTP 也保留 folder 設定,
+            # 這樣下次開 OTP 不需要重選)
+            folder_raw = folder_path_var.get().strip()
+            new_folder: str | None = folder_raw if folder_raw else None
             try:
                 otp_settings.set_otp_enabled(bool(enabled_var.get()))
                 otp_settings.set_otp_subscribed_stores(new_setting)
+                otp_settings.set_otp_target_folder(new_folder)
             except Exception as e:
                 status_lbl.configure(text=f"⚠ 存檔失敗:{e}")
                 return
@@ -1374,6 +1416,162 @@ class PwmgrApp:
         )
 
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _open_otp_folder_picker(self, parent: tk.Toplevel, current_path: str | None) -> str | None:
+        """彈出「選擇 OTP folder」對話框。
+
+        走 Outlook COM 列出每個 store 的 Inbox + 第一層 subfolder(跳過
+        Junk / Drafts / Sent Items 等系統 folder),user 雙擊或「確定」選一個。
+        回傳選中的 path(字串),或 None = user 取消。回空字串 = user 選「清除」。
+
+        COM 抓 folder tree 在背景 thread 跑(可能要 1-3 秒,直接跑會 freeze Tk),
+        抓完後用 ``parent.after(0, ...)`` marshal 回 main thread 更新 Treeview。
+        """
+        import threading
+
+        from . import outlook_monitor
+
+        dlg = tk.Toplevel(parent)
+        dlg.title("選擇 OTP folder")
+        dlg.transient(parent)
+        dlg.configure(background=PALETTE["bg"])
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        dlg.geometry("460x460")
+        dlg.minsize(380, 360)
+
+        top = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 14, 18, 8))
+        top.pack(side=tk.TOP, fill=tk.X, padx=14, pady=(14, 0))
+        ttk.Label(top, text="選擇 OTP folder", style="Header.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            top,
+            text="Outlook rule 把 OTP 信搬去的資料夾。沒設定就用每個 store 的 Inbox。",
+            style="CardMuted.TLabel", wraplength=400, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(
+            top, text="目前:", style="CardMuted.TLabel",
+        ).pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(
+            top, text=current_path or "(未設定 — 走預設 Inbox)",
+            font=FONT_BASE, wraplength=400, justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        middle = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 4))
+        middle.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=14, pady=8)
+
+        loading_lbl = ttk.Label(
+            middle, text="讀取 Outlook folder tree…", style="CardMuted.TLabel",
+        )
+        loading_lbl.pack(anchor=tk.W, pady=(0, 6))
+
+        tree_outer = ttk.Frame(middle, style="Card.TFrame", padding=1)
+        tree_outer.pack(fill=tk.BOTH, expand=True)
+        tree = ttk.Treeview(
+            tree_outer, columns=("path",), show="tree", selectmode="browse",
+        )
+        tree.column("#0", width=200, anchor=tk.W)
+        tree.column("path", width=200, anchor=tk.W)
+        sb = ttk.Scrollbar(tree_outer, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 一開始只顯示 loading,等 folder 讀完才把 tree_outer 顯示出來
+        tree_outer.pack_forget()
+
+        tree.bind("<Double-1>", lambda _e: _on_pick())
+
+        def _on_pick() -> None:
+            sel = tree.selection()
+            if not sel:
+                status_lbl.configure(text="⚠ 請先選一個 folder")
+                return
+            iid = sel[0]
+            path = tree.set(iid, "path")
+            if not path:
+                status_lbl.configure(text="⚠ 請選到最底的子 folder,不是 store 名稱")
+                return
+            dlg.result = ("picked", path)
+            dlg.destroy()
+
+        def _on_clear() -> None:
+            dlg.result = ("cleared", "")
+            dlg.destroy()
+
+        def _on_cancel() -> None:
+            dlg.result = ("cancelled", None)
+            dlg.destroy()
+
+        dlg.result = ("cancelled", None)
+
+        bottom = ttk.Frame(dlg, style="Card.TFrame", padding=(18, 4, 18, 14))
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 14))
+        status_lbl = ttk.Label(bottom, text="", style="CardMuted.TLabel", wraplength=420)
+        status_lbl.pack(anchor=tk.W)
+
+        btn_row = ttk.Frame(bottom, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="取消", command=_on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="清除設定", command=_on_clear).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(
+            btn_row, text="確定選定", style="Accent.TButton", command=_on_pick,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dlg.bind("<Escape>", lambda _e: _on_cancel())
+
+        def _fetch_worker() -> None:
+            try:
+                folders = outlook_monitor.list_otp_candidate_folders(max_depth=2)
+                parent.after(0, _on_folders_ready, folders, None)
+            except Exception as e:
+                parent.after(0, _on_folders_ready, None, f"{type(e).__name__}: {e}")
+
+        def _on_folders_ready(folders: dict[str, Any] | None, err: str | None) -> None:
+            loading_lbl.destroy()
+            tree_outer.pack(fill=tk.BOTH, expand=True)
+            if err or not folders or not folders.get("ok"):
+                status_lbl.configure(
+                    text="⚠ 讀取 Outlook folder 失敗:"
+                    + (err or (folders and folders.get("error")) or "未知錯誤")
+                )
+                return
+            items = folders.get("folders", [])
+            # 虛擬 root 把多個 store 包起來
+            tree.insert("", tk.END, iid="__root__", text="📂 Outlook", values=("",))
+            parent_map: dict[str, str] = {"": "__root__"}
+            for f in items:
+                path = f["path"]
+                depth = f.get("depth", 0)
+                name = f.get("name", path)
+                parts = path.split("/")
+                parent_path = "" if len(parts) == 1 else "/".join(parts[:-1])
+                parent_iid = parent_map.get(parent_path, "__root__")
+                icon = "📁" if depth == 0 else "📂"
+                display = f"{icon} {name}" if depth == 0 else name
+                iid = tree.insert(
+                    parent_iid, tk.END, iid=path, text=display,
+                    values=(path,),
+                )
+                parent_map[path] = iid
+            for store_iid in tree.get_children("__root__"):
+                tree.item(store_iid, open=True)
+                for inbox_iid in tree.get_children(store_iid):
+                    tree.item(inbox_iid, open=True)
+            if current_path and tree.exists(current_path):
+                tree.selection_set(current_path)
+                tree.see(current_path)
+
+        t = threading.Thread(target=_fetch_worker, daemon=True, name="pwmgr-folder-picker")
+        t.start()
+
+        dlg.wait_window()
+        kind, payload = dlg.result
+        if kind == "picked":
+            return str(payload) if payload else ""
+        if kind == "cleared":
+            return ""
+        return None  # cancelled
 
     def _toggle_otp_from_tray(self) -> None:
         """從 system tray 的「OTP 監聽」checkable menu 觸發。

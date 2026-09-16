@@ -91,7 +91,14 @@ OTP_CACHE_TTL_SECONDS = 600
 
 # Outlook 監聽的 subject pattern 列表(任一包含即視為 OTP 信)
 # 後續可擴充其他站的 OTP 信(目前先針對 Dell)
-OTP_SUBJECT_PATTERNS: list[str] = ["Dell One-time Password","[External Mail] Dell One-time Password"]
+# 注意:Dell 對不同語系網域發的 OTP 信件 subject 會用當地語系(中文網域 →「一次性密碼」,
+# 英文網域 → "One-time Password"),所以 pattern 兩種都列,regex 配 IGNORECASE。
+OTP_SUBJECT_PATTERNS: list[str] = [
+    "Dell One-time Password",
+    "Dell 一次性密碼",
+    "[External Mail] Dell One-time Password",
+    "[External Mail] Dell 一次性密碼",
+]
 
 # 從信件 body 抽出 OTP code 的 regex。\b word boundary 避免 7 位電話誤判
 OTP_CODE_REGEX: str = r"\b(\d{6})\b"
