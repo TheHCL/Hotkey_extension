@@ -630,6 +630,15 @@ class OutlookMonitor:
 # --- On-demand query (cache miss 時的 fallback) --------------------------------
 
 
+
+# 單一 folder 每次 attempt 最多翻幾封信(不管有沒有命中 subject/時間窗)。
+# 沒有這個上限的話,若 10 分鐘內的新信不到 lookback_count 封,
+# `for item in items` 不會提早 break,會把整個 Items collection 掃完 ——
+# 大信箱下這是外部 process 對 Outlook COM apartment 做的 O(n) 遍歷,
+# 容易讓 Outlook UI 感覺卡頓。加這個 cap 讓每次 attempt 的 worst case 有界。
+_SCAN_HARD_LIMIT = 200
+
+
 def fetch_latest_otp(
     subject_patterns: list[str] | None = None,
     code_regex: str = DEFAULT_CODE_REGEX,
@@ -738,7 +747,15 @@ def fetch_latest_otp(
                     scan_stats.append(f"[{folder_label}] 取 Items 失敗:{e}")
                     continue
                 checked = 0
+                examined = 0
                 for item in items:
+                    examined += 1
+                    if examined > _SCAN_HARD_LIMIT:
+                        scan_stats.append(
+                            f"[{folder_label}] 掃到上限 {_SCAN_HARD_LIMIT} 筆仍未收集滿 "
+                            f"{lookback_count} 筆,提早停止"
+                        )
+                        break
                     if checked >= lookback_count:
                         break
                     try:
