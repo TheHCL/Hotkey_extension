@@ -17,6 +17,8 @@ let lastTabUrl = null;   // 上次主動查詢的 URL(避免重複 query)
 let currentMatches = {}; // tabId -> [{id, label, username, url}]
 let pendingFill = {};    // tabId -> { username, password, url, timer }
 let launchFillTabsSync = new Set(); // launchAndFill 開的 tabId(in-memory,onUpdated listener 同步檢查用)
+// 目前還在跑的 getOtp(poll_seconds>0)輪詢 promise,見 getOtp handler 內註解。
+let pendingOtpPoll = null;
 
 // --- executeScript 注入的 fillFn --------------------------------------------
 //
@@ -359,7 +361,16 @@ function clearPendingFill(tabId) {
   });
 }
 
-function sendNative(msg) {
+// 預設 timeout。注意:getOtp(poll_seconds>0)不能沿用這個常數 —
+// native host 那邊的 polling 迴圈本身就要花 poll_seconds 秒,再加上訊息傳遞
+// 跟每次 COM 呼叫的開銷,實際回應時間一定會超過 poll_seconds。之前這裡固定
+// 15000ms 剛好等於 popup.js 的 OTP_POLL_SECONDS(15s),等於是兩邊時間卡在
+// 同一條線上賽跑 — native 那邊只會「更慢」不會「更快」,所以 JS 這裡幾乎每次
+// 都先 timeout,導致 user 看到「取得失敗:TIMEOUT」,即使 native host 其實
+// 再等一下就會回傳正確的 code。呼叫端(getOtp)要自己算夠寬的 timeoutMs 傳進來。
+const DEFAULT_NATIVE_TIMEOUT_MS = 15000;
+
+function sendNative(msg, timeoutMs) {
   return new Promise((resolve) => {
     if (!nativePort) connectNative();
     const port = nativePort; // 鎖定這次呼叫實際用的 port,避免之後 nativePort 變 null 時仍讀到舊變數
@@ -383,12 +394,11 @@ function sendNative(msg) {
     } catch (e) {
       settle({ ok: false, code: "SEND_FAIL", error: String(e) });
     }
-    // port 若在等待回應期間斷線,不必等滿 5 秒 timeout
+    // port 若在等待回應期間斷線,不必等滿 timeout
     port.onDisconnect.addListener(() => settle({ ok: false, code: "DISCONNECTED" }));
-    // 5 秒 timeout
     setTimeout(() => {
       settle({ ok: false, code: "TIMEOUT" });
-    }, 15000);
+    }, timeoutMs || DEFAULT_NATIVE_TIMEOUT_MS);
   });
 }
 
@@ -691,12 +701,34 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       : 0;
     (async () => {
       try {
-        console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP (poll=" + pollSeconds + "s)");
-        const req = { type: "get_otp" };
-        if (pollSeconds > 0) req.poll_seconds = pollSeconds;
-        const resp = pollSeconds > 0
-          ? await sendNative(req)
-          : await sendNativeWithColdStartRetry(req, 1500);
+        // user 連點按鈕(popup 每次點擊都是獨立的 chrome.runtime.sendMessage,
+        // 就算上一次點擊的 popup 已經關掉,前一個 getOtp 請求還是會在 native
+        // host 那邊繼續跑)。native host 是單執行緒逐一處理請求(見
+        // native_host.py 的 run() 主迴圈),所以連點 N 下 = 排 N 個 get_otp
+        // 請求,每個都可能各自跑滿 poll_seconds、每 2 秒對 Outlook 做一次完整
+        // COM 掃描 —— 疊加起來就是連續好幾十秒的 Outlook COM 呼叫,切回
+        // Outlook 視窗時感覺卡頓。
+        // 解法:poll_seconds>0 的請求全部共用同一個 in-flight promise —— 如果
+        // 已經有一輪 polling 在跑,新按下的按鈕直接等那一輪的結果,不會再送一個
+        // 新請求給 native host。
+        let resp;
+        if (pollSeconds > 0) {
+          if (!pendingOtpPoll) {
+            console.log("[pwmgr] getOtp: 開始跟 native host 要 OTP (poll=" + pollSeconds + "s)");
+            const req = { type: "get_otp", poll_seconds: pollSeconds };
+            // native host 的輪詢迴圈本身就要花 pollSeconds 秒,還要加上每次 COM
+            // 呼叫 + 訊息傳遞的開銷,JS 這邊的 timeout 必須明顯比 pollSeconds 寬,
+            // 否則幾乎每次都會在 native host 真正回應前就先 timeout。
+            pendingOtpPoll = sendNative(req, pollSeconds * 1000 + 10000).finally(() => {
+              pendingOtpPoll = null;
+            });
+          } else {
+            console.log("[pwmgr] getOtp: 已有一輪 polling 在跑,搭同一班車等結果");
+          }
+          resp = await pendingOtpPoll;
+        } else {
+          resp = await sendNativeWithColdStartRetry({ type: "get_otp" }, 1500);
+        }
         console.log("[pwmgr] getOtp: native host resp =", resp);
         sendResponse(resp || { ok: false, code: "EMPTY", error: "native host 回傳空" });
       } catch (e) {

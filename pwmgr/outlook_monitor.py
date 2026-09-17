@@ -1106,6 +1106,37 @@ def _safe_get_folder(session, folder_id: int, label: str):
 # --- 給 native host 用:cache-first + live fallback ----------------------------
 
 
+def read_cached_otp(cache_path: Path, max_age_seconds: int = 600) -> dict[str, Any] | None:
+    """只讀 cache,命中回 dict(``source`` = ``cache``),沒有可用資料回 ``None``。
+
+    抽出來給 ``get_latest_otp``(單次模式)跟 native_host 的 polling 模式共用 —
+    polling 模式(``poll_seconds > 0``)先前完全跳過 cache 直接 live scan Outlook,
+    background monitor thread 早就寫好的 cache 反而沒被讀到,造成「cache 裡有正確
+    code,但按鈕按下去卻抓不到」。
+    """
+    if not cache_path.exists():
+        return None
+    cutoff = time.time() - max_age_seconds
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for entry in data.get("codes", []):
+            if not isinstance(entry, dict):
+                continue
+            recv = entry.get("received_at", 0)
+            if isinstance(recv, (int, float)) and recv >= cutoff:
+                return {
+                    "ok": True,
+                    "code": str(entry.get("code", "")),
+                    "subject": str(entry.get("subject", "")),
+                    "received_at": recv,
+                    "source": "cache",
+                }
+    except Exception as e:
+        print(f"[pwmgr][outlook] cache read 失敗: {e}")
+    return None
+
+
 def get_latest_otp(
     cache_path: Path,
     subject_patterns: list[str] | None = None,
@@ -1116,27 +1147,10 @@ def get_latest_otp(
 
     回傳格式同 ``fetch_latest_otp``,但 ``source`` 欄位會標 ``cache`` 或 ``live``。
     """
-    cutoff = time.time() - max_age_seconds
-
     # 1. Cache 先試(快,通常命中)
-    if cache_path.exists():
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for entry in data.get("codes", []):
-                if not isinstance(entry, dict):
-                    continue
-                recv = entry.get("received_at", 0)
-                if isinstance(recv, (int, float)) and recv >= cutoff:
-                    return {
-                        "ok": True,
-                        "code": str(entry.get("code", "")),
-                        "subject": str(entry.get("subject", "")),
-                        "received_at": recv,
-                        "source": "cache",
-                    }
-        except Exception as e:
-            print(f"[pwmgr][outlook] cache read 失敗: {e}")
+    cached = read_cached_otp(cache_path, max_age_seconds=max_age_seconds)
+    if cached is not None:
+        return cached
 
     # 2. Cache miss → live fallback
     return fetch_latest_otp(

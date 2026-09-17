@@ -451,6 +451,35 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
             "error": "outlook_monitor 回傳格式錯誤",
         }
 
+    # Polling 模式先查一次 cache。
+    # 這一步补上原本的洞:polling 模式先前完全跳過 cache,直接開 live scan Outlook,
+    # 導致「cache 裡已經有正確 code,按鈕按下去卻抓不到」— 因為 live scan 跟背景
+    # monitor thread 走的是兩條獨立路徑,掃描時機/範圍不完全一樣,可能漏掉背景
+    # thread 早就抓到、寫進 cache 的那封信。
+    #
+    # 原本這裡只在 target_folder 是 None 時才檢查 cache,理由是「設了
+    # target_folder 的 user 通常背景 monitor 已關,cache 不可信」——但這只是
+    # 假設,實際上 user 可能同時設了 target_folder *又*讓背景 monitor 繼續跑
+    # (例如只是想讓 live scan 更精準,不代表要停用背景監聽)。這種情況下
+    # otp_cache.json 裡的資料是背景 monitor 剛從 Inbox 抓到的、貨真價實的 code,
+    # 但因為 target_folder 指到別的資料夾(信實際還在 Inbox,還沒被規則搬走,
+    # 或設錯路徑),live scan 找不到對應的信,於是輪完 poll_seconds 仍回
+    # NO_CODE,即使 cache 早就有正確答案。
+    # → cache 是否可信只該看「有沒有新鮮資料」,跟 target_folder 有沒有設無關,
+    # 所以這裡拿掉 target_folder is None 的限制,一律先查 cache。
+    cached = outlook_monitor.read_cached_otp(otp_cache_path(), max_age_seconds=max_age)
+    if cached is not None:
+        return {
+            "ok": True,
+            "code": str(cached.get("code", "")),
+            "subject": str(cached.get("subject", "")),
+            "received_at": float(cached.get("received_at", 0.0)),
+            "source": "cache",
+            "folder": "",
+            "attempts": 0,
+            "poll_seconds": poll_seconds,
+        }
+
     # Polling 模式:每 2 秒戳一次 Outlook,honor target_folder_path
     poll_interval = 2.0
     deadline = time.monotonic() + poll_seconds
@@ -459,6 +488,30 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
 
     while True:
         attempt += 1
+        # 每輪 live scan 前先再看一次 cache。
+        # 為什麼要在迴圈裡面重複查(不是只在迴圈外查一次就好):user 連點按鈕
+        # 好幾下時,每次點擊都會送一個 get_otp 請求,native host 是單執行緒逐一
+        # 處理(見 run() 的主迴圈),所以會排隊。如果前面幾個請求在 cache 還沒
+        # 資料時就已經進了這個迴圈,它們會各自跑滿 poll_seconds、每 2 秒對
+        # Outlook 做一次完整的 COM Items 掃描 —— background monitor thread
+        # 可能在其中某一輪把信寫進 cache 了,但沒有這個 cache 複查,後面排隊的
+        # 每個請求還是會傻傻地繼續掃到自己的 15 秒用完,疊加起來就是好幾十秒
+        # 連續的 Outlook COM 呼叫,讓 Outlook 主執行緒(STA)一直忙著回應這些
+        # 呼叫、切回 Outlook 視窗時感覺卡頓。每輪都查一次 cache 可以讓排隊中的
+        # 請求一旦有其他來源(背景 monitor 或先跑完的請求)把答案寫進 cache,
+        # 就立刻停手,不用真的等到自己的 poll_seconds 用完。
+        cached = outlook_monitor.read_cached_otp(otp_cache_path(), max_age_seconds=max_age)
+        if cached is not None:
+            return {
+                "ok": True,
+                "code": str(cached.get("code", "")),
+                "subject": str(cached.get("subject", "")),
+                "received_at": float(cached.get("received_at", 0.0)),
+                "source": "cache",
+                "folder": "",
+                "attempts": attempt,
+                "poll_seconds": poll_seconds,
+            }
         result = outlook_monitor.fetch_latest_otp(
             subject_patterns=OTP_SUBJECT_PATTERNS,
             code_regex=OTP_CODE_REGEX,
