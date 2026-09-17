@@ -457,6 +457,17 @@ class OutlookMonitor:
                             _drop_eid(eid)
                             continue
                         subj = str(item.Subject or "")
+                        # 先比對 subject pattern,不match 就直接丟掉、不讀 Body。
+                        # 原因:`item.Body` 對 HTML 信是完整內容,COM 讀取這個
+                        # property 比 Subject 貴得多(尤其大附件/圖片多的信);
+                        # 一般信箱大部分新信都不是 OTP 信,若每封都無條件讀
+                        # Body 再交給 _ingest 判斷 subject,等於平白讓 Outlook
+                        # 為每一封「不相關」的新信付出額外 COM 開銷 —— 這是
+                        # user 回報「有新信件進來就卡頓,即使 title 沒 match」
+                        # 的直接原因。
+                        if not any(cre.search(subj) for cre in self._subject_res):
+                            _drop_eid(eid)
+                            continue
                         body = str(item.Body or "")
                     except Exception as e:
                         # 極少數狀況:resolve 成功但讀 property 還是有問題
@@ -545,7 +556,14 @@ class OutlookMonitor:
                     if eid in new_seen:
                         break  # 已看過 → 之後都是更舊的
                     new_seen = new_seen | {eid}  # 建新 set,不 mutate 參數
-                    self._ingest(str(item.Subject or ""), str(item.Body or ""))
+                    # 先比對 subject,不 match 就不讀 Body(理由同
+                    # _run_event_driven 那邊的註解:Body 是完整信件內容,COM
+                    # 讀取比 Subject 貴很多,大部分新信都不是 OTP 信,不該
+                    # 每封都白白付出這個開銷)。
+                    subj = str(item.Subject or "")
+                    if not any(cre.search(subj) for cre in self._subject_res):
+                        continue
+                    self._ingest(subj, str(item.Body or ""))
                 except Exception:
                     # 單封信處理失敗不要影響整輪
                     continue
@@ -637,6 +655,26 @@ class OutlookMonitor:
 # 大信箱下這是外部 process 對 Outlook COM apartment 做的 O(n) 遍歷,
 # 容易讓 Outlook UI 感覺卡頓。加這個 cap 讓每次 attempt 的 worst case 有界。
 _SCAN_HARD_LIMIT = 200
+
+
+def _iter_items_newest_first(items):
+    """用 GetLast()/GetPrevious() 由新到舊走訪 Outlook Items collection。
+
+    不用 `for item in items`(COM 預設 enumerator,順序是 collection 內部順序,
+    通常接近到達順序=舊到新)、也不呼叫 `items.Sort`(Exchange 信箱是網路
+    round-trip,大信箱會很慢)。GetLast/GetPrevious 是 Outlook COM 原生支援
+    的走訪方式,直接由最新的一封開始,不需要額外排序開銷。
+    """
+    try:
+        item = items.GetLast()
+    except Exception:
+        return
+    while item is not None:
+        yield item
+        try:
+            item = items.GetPrevious()
+        except Exception:
+            return
 
 
 def fetch_latest_otp(
@@ -734,11 +772,14 @@ def fetch_latest_otp(
 
             recent_subjects: list[str] = []
             # 收集所有符合的 OTP 信,最後按 ReceivedTime 倒序取最新那封。
-            # 原因:Outlook COM Items 預設順序不保證 desc by ReceivedTime
-            # (Exchange 信箱甚至可能按 EntryID 或其他 key);如果直接拿第一個
-            # 符合的,可能拿到的是較舊的信,user 就會看到「按按鈕抓的都是上一次的」。
-            # 不呼叫 items.Sort 因為 Exchange 信箱 Sort 是網路 round-trip,
-            # 大信箱下會 timeout;改成在 Python 內 sort。
+            # 用 GetLast/GetPrevious 從新到舊走訪(不呼叫 items.Sort,那是網路
+            # round-trip,大信箱下會 timeout)。這比原本 `for item in items`
+            # (COM 預設 enumerator,常常是舊到新的到達順序)快很多:大信箱下
+            # 用 for-loop 得先掃過幾百封舊信才會碰到最新的幾封,每封都要
+            # ReceivedTime/Subject/Body 三次 COM property fetch,是實測按鈕
+            # 點下去 Outlook 卡住幾秒的主因;新到舊走訪通常 1~2 封就能命中,
+            # 而且一旦碰到超出 max_age 的信就能直接整個 break(不用像舊版只是
+            # continue、繼續耗 _SCAN_HARD_LIMIT 次數),因為再往前只會更舊。
             matches: list[dict[str, Any]] = []
             for folder_label, folder in targets:
                 try:
@@ -748,7 +789,7 @@ def fetch_latest_otp(
                     continue
                 checked = 0
                 examined = 0
-                for item in items:
+                for item in _iter_items_newest_first(items):
                     examined += 1
                     if examined > _SCAN_HARD_LIMIT:
                         scan_stats.append(
@@ -764,7 +805,13 @@ def fetch_latest_otp(
                         recv = item.ReceivedTime
                         recv_ts = time.mktime(recv.timetuple()) if recv else 0.0
                         if recv_ts < cutoff:
-                            continue
+                            # 新到舊順序下,再往前只會更舊 — 直接整個 break,
+                            # 不用像舊版只 continue、白白耗掉剩下的 examined 額度。
+                            scan_stats.append(
+                                f"[{folder_label}] 已掃到 max_age 之外的信"
+                                f"(examined={examined}),提早停止"
+                            )
+                            break
                         checked += 1
                         subj = str(item.Subject or "")
                         if len(recent_subjects) < 5:
