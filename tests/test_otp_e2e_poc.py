@@ -288,6 +288,10 @@ def main() -> int:
 
             # --- Step 9: target_folder_path 不存在 → OTP_FOLDER_NOT_FOUND ---
             print("\n[9] target_folder_path 設到不存在的 folder → OTP_FOLDER_NOT_FOUND")
+            # polling 模式現在一律先查 cache(見 native_host._handle_get_otp),
+            # 上一步(Step 7)寫的 "112233" 還在 max_age 內、會蓋掉這裡想測的
+            # live-scan 失敗路徑,所以先清空 cache 讓這步真的走到 live scan。
+            cache_path.write_text('{"codes": []}', encoding="utf-8")
             # 透過 settings 設一個不存在路徑,然後觸發 polling
             otp_settings_mod.set_otp_target_folder("your-email@your-domain.com/Inbox/不存在資料夾")
             outlook_monitor.fetch_latest_otp = lambda **kwargs: {
