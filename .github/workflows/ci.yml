@@ -28,4 +28,8 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v
+        # windows-latest runner 偶爾會在快速連續建立/銷毀多個 tk.Tk() 時,
+        # 短暫鎖住 tcl/tk 的 library 檔案(疑似 Windows Defender 即時掃描),
+        # 導致 _tkinter.TclError: Can't find a usable init.tcl/tk.tcl。
+        # 只針對這個特定例外重跑,真正的邏輯錯誤(AssertionError 等)不會被蓋過。
+        run: pytest tests/ -v --reruns 2 --reruns-delay 1 --only-rerun "_tkinter.TclError"
