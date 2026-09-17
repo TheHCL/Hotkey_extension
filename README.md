@@ -319,6 +319,16 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
+### CI/CD
+
+- **CI**(`.github/workflows/ci.yml`)— push / PR 到 `main` 時,在 `windows-latest` 跑 `pytest tests/ -v`。
+  之所以指定 Windows runner,是因為 `pwmgr/hotkey.py` 在 import 時就呼叫
+  `ctypes.WinDLL("user32")`,`test_app_smoke.py` 因此只能在 Windows 上跑。
+- **Release**(`.github/workflows/release.yml`)— push `v*.*.*` tag 時觸發:
+  跑測試 → `python packaging/build.py` 產生 `PWmgr.exe` + `PWmgrSetup.exe` →
+  把 `dist/PWmgr/` 連同 `chrome_extension/` 一起打包成 zip → 建立 GitHub Release
+  並附上 `PWmgr-<tag>.zip`、`PWmgrSetup.exe` 兩個檔案。
+
 ### 模組總覽
 
 | 模組 | 職責 |
