@@ -237,7 +237,10 @@ def test_save_entry_rejects_oversized_group(
     a.username_var.set("u")
     a.group_var.set("x" * 65)
     a.password_var.set("p")
-    a._save_entry()
+    # _save_entry 會秀出 messagebox,測試環境沒人會去點掉它,要 mock 掉
+    # 不然在有真 Tk 視窗的環境(例如 Windows CI runner)會卡死等使用者互動
+    with patch("tkinter.messagebox.showwarning"):
+        a._save_entry()
 
     # 沒寫進去,vault 還是空的
     assert storage.load_index() == []

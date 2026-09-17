@@ -11,6 +11,7 @@ jobs:
     # 專案依賴 Windows API(ctypes.WinDLL 熱鍵、Windows Credential Manager),
     # 只有 windows-latest 能完整跑過整個 tests/(尤其是 test_app_smoke.py)。
     runs-on: windows-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
