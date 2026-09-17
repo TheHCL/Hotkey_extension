@@ -11,6 +11,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # packaging/build.py 印出的完成訊息含中文;CI 的 stdout 沒接真的 console,
+      # Python 預設會落到系統 cp1252 codepage 編碼,印中文字會 UnicodeEncodeError。
+      PYTHONUTF8: "1"
 
     steps:
       - uses: actions/checkout@v4
