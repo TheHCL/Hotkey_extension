@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest>=7.0
+pytest-rerunfailures>=14.0
 pyinstaller>=6.8

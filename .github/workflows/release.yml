@@ -28,14 +28,18 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v
+        # windows-latest runner 偶爾會在快速連續建立/銷毀多個 tk.Tk() 時,
+        # 短暫鎖住 tcl/tk 的 library 檔案(疑似 Windows Defender 即時掃描),
+        # 導致 _tkinter.TclError: Can't find a usable init.tcl/tk.tcl。
+        # 只針對這個特定例外重跑,真正的邏輯錯誤(AssertionError 等)不會被蓋過。
+        run: pytest tests/ -v --reruns 2 --reruns-delay 1 --only-rerun "_tkinter.TclError"
 
       - name: Build PWmgr.exe + PWmgrSetup.exe
         # packaging/build.py 印出的完成訊息含中文;CI 的 stdout 沒接真的 console,
         # Python 預設會落到系統 cp1252 codepage 編碼,印中文字會 UnicodeEncodeError。
-        # 只在這個 step 設 PYTHONIOENCODING(只影響 stdout/stderr 編碼),
-        # 不要設整個 job 共用的 PYTHONUTF8——那個連檔案系統編碼一起改,
-        # 會害 tkinter 在 Windows 上找不到 init.tcl。
+        # 只在這個 step 設 PYTHONIOENCODING(只影響 stdout/stderr 編碼),不設
+        # 整個 job 共用的 PYTHONUTF8(先前試過,結果證實與 tcl/tk 的間歇性
+        # 讀檔失敗無關,是誤判——但範圍仍縮小到單一 step,不冒不必要的風險)。
         env:
           PYTHONIOENCODING: "utf-8"
         run: python packaging/build.py
