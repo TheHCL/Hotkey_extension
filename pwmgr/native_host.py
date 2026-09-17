@@ -34,9 +34,7 @@ from .config import (
     MAX_PASSWORD_BYTES,
     OTP_CACHE_TTL_SECONDS,
     OTP_CODE_REGEX,
-    OTP_LOOKBACK_COUNT,
     OTP_SUBJECT_PATTERNS,
-    otp_cache_path,
 )
 from .models import PasswordEntry
 
@@ -362,16 +360,11 @@ def _handle_solve_captcha(req: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# --- OTP 自動填 ----------------------------------------------------------------
+# --- OTP 自動填(lazy on-demand,沒有背景常駐監聽) -----------------------------
 #
 # 由 Chrome extension 透過 popup 觸發:user 在 OTP 頁按下「取得驗證碼」按鈕 →
-# popup → background → native host → 此 handler。
-#
-# 流程:
-#   1. 讀 PWmgr GUI 的 outlook_monitor 寫的 cache JSON(快,通常命中)
-#   2. cache miss 或過期 → on-demand 開 Outlook COM 翻最近 Inbox(慢但可用)
-#
-# outlook_monitor.get_latest_otp 已把以上兩個策略封裝好,直接呼叫。
+# popup → background → native host → 此 handler → outlook_monitor.fetch_latest_otp
+# 直接開 Outlook COM 查。沒有 cache、沒有背景 thread — 只有按按鈕的當下才碰 Outlook。
 
 _OTP_MAX_AGE_SECONDS_LIMIT = 3600  # 上限 1 小時,避免 caller 傳怪值
 
@@ -379,16 +372,12 @@ _OTP_MAX_AGE_SECONDS_LIMIT = 3600  # 上限 1 小時,避免 caller 傳怪值
 def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
     """取得最近一封符合 pattern 的 OTP code。
 
-    支援兩種模式(由 ``poll_seconds`` 決定):
-
-    - **單次**(``poll_seconds <= 0`` 或未給):一次 fetch_latest_otp 就回。
-      原本的快取 cache-first 也保留,但 GUI 改成 lazy polling 後幾乎都走這條。
-
-    - **輪詢** (``poll_seconds > 0``):在 user 設定的秒數內,每 2 秒撈一次 Outlook,
-      拿到 code 就 return,timeout 就回 NO_CODE。這是按按鈕才 polling 的實作。
+    ``poll_seconds`` 決定要不要重試:
+    - 0(單次):查一次就回,沒有就 NO_CODE。
+    - >0:在期限內每 2 秒查一次 Outlook,拿到就回,timeout 回 NO_CODE。
 
     若 user 在 GUI 把 OTP 主開關關掉(otp_enabled=False),直接回 OTP_DISABLED,
-    不開 Outlook COM、不讀 cache。
+    不開 Outlook COM。
     """
     try:
         from . import settings as otp_settings
@@ -397,7 +386,7 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
             return {
                 "ok": False,
                 "code": "OTP_DISABLED",
-                "error": "OTP 監聽已停用(請到 PWmgr GUI「OTP 監聽設定」啟用)",
+                "error": "OTP 自動填入已停用(請到 PWmgr GUI「OTP 設定」啟用)",
             }
         target_folder = otp_settings.get_otp_target_folder()
     except Exception:
@@ -420,67 +409,6 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
     # 上限保護 — 避免 user 設超大值卡死 native host
     poll_seconds = min(float(poll_seconds), float(_OTP_MAX_AGE_SECONDS_LIMIT))
 
-    # 單次模式(poll_seconds == 0)走 cache-first 保留既有行為:
-    # background monitor thread 寫的 cache 可能已經有 code,可以秒回。
-    # 注意:cache-first 路徑不支援 target_folder(背景 monitor thread 也只看 inbox),
-    # 這是預期行為 — 設了 target_folder 的 user 通常是 lazy 模式(背景 monitor 關),
-    # 走 fetch_latest_otp 的 polling 會 honor target_folder。
-    if poll_seconds <= 0:
-        result = outlook_monitor.get_latest_otp(
-            cache_path=otp_cache_path(),
-            subject_patterns=OTP_SUBJECT_PATTERNS,
-            code_regex=OTP_CODE_REGEX,
-            max_age_seconds=max_age,
-        )
-        if isinstance(result, dict) and result.get("ok"):
-            return {
-                "ok": True,
-                "code": str(result.get("code", "")),
-                "subject": str(result.get("subject", "")),
-                "received_at": float(result.get("received_at", 0.0)),
-                "source": str(result.get("source", "")),
-                "folder": str(result.get("folder", "")),
-                "attempts": 1,
-                "poll_seconds": 0,
-            }
-        if isinstance(result, dict):
-            return result
-        return {
-            "ok": False,
-            "code": "UNKNOWN",
-            "error": "outlook_monitor 回傳格式錯誤",
-        }
-
-    # Polling 模式先查一次 cache。
-    # 這一步补上原本的洞:polling 模式先前完全跳過 cache,直接開 live scan Outlook,
-    # 導致「cache 裡已經有正確 code,按鈕按下去卻抓不到」— 因為 live scan 跟背景
-    # monitor thread 走的是兩條獨立路徑,掃描時機/範圍不完全一樣,可能漏掉背景
-    # thread 早就抓到、寫進 cache 的那封信。
-    #
-    # 原本這裡只在 target_folder 是 None 時才檢查 cache,理由是「設了
-    # target_folder 的 user 通常背景 monitor 已關,cache 不可信」——但這只是
-    # 假設,實際上 user 可能同時設了 target_folder *又*讓背景 monitor 繼續跑
-    # (例如只是想讓 live scan 更精準,不代表要停用背景監聽)。這種情況下
-    # otp_cache.json 裡的資料是背景 monitor 剛從 Inbox 抓到的、貨真價實的 code,
-    # 但因為 target_folder 指到別的資料夾(信實際還在 Inbox,還沒被規則搬走,
-    # 或設錯路徑),live scan 找不到對應的信,於是輪完 poll_seconds 仍回
-    # NO_CODE,即使 cache 早就有正確答案。
-    # → cache 是否可信只該看「有沒有新鮮資料」,跟 target_folder 有沒有設無關,
-    # 所以這裡拿掉 target_folder is None 的限制,一律先查 cache。
-    cached = outlook_monitor.read_cached_otp(otp_cache_path(), max_age_seconds=max_age)
-    if cached is not None:
-        return {
-            "ok": True,
-            "code": str(cached.get("code", "")),
-            "subject": str(cached.get("subject", "")),
-            "received_at": float(cached.get("received_at", 0.0)),
-            "source": "cache",
-            "folder": "",
-            "attempts": 0,
-            "poll_seconds": poll_seconds,
-        }
-
-    # Polling 模式:每 2 秒戳一次 Outlook,honor target_folder_path
     poll_interval = 2.0
     deadline = time.monotonic() + poll_seconds
     attempt = 0
@@ -488,30 +416,6 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
 
     while True:
         attempt += 1
-        # 每輪 live scan 前先再看一次 cache。
-        # 為什麼要在迴圈裡面重複查(不是只在迴圈外查一次就好):user 連點按鈕
-        # 好幾下時,每次點擊都會送一個 get_otp 請求,native host 是單執行緒逐一
-        # 處理(見 run() 的主迴圈),所以會排隊。如果前面幾個請求在 cache 還沒
-        # 資料時就已經進了這個迴圈,它們會各自跑滿 poll_seconds、每 2 秒對
-        # Outlook 做一次完整的 COM Items 掃描 —— background monitor thread
-        # 可能在其中某一輪把信寫進 cache 了,但沒有這個 cache 複查,後面排隊的
-        # 每個請求還是會傻傻地繼續掃到自己的 15 秒用完,疊加起來就是好幾十秒
-        # 連續的 Outlook COM 呼叫,讓 Outlook 主執行緒(STA)一直忙著回應這些
-        # 呼叫、切回 Outlook 視窗時感覺卡頓。每輪都查一次 cache 可以讓排隊中的
-        # 請求一旦有其他來源(背景 monitor 或先跑完的請求)把答案寫進 cache,
-        # 就立刻停手,不用真的等到自己的 poll_seconds 用完。
-        cached = outlook_monitor.read_cached_otp(otp_cache_path(), max_age_seconds=max_age)
-        if cached is not None:
-            return {
-                "ok": True,
-                "code": str(cached.get("code", "")),
-                "subject": str(cached.get("subject", "")),
-                "received_at": float(cached.get("received_at", 0.0)),
-                "source": "cache",
-                "folder": "",
-                "attempts": attempt,
-                "poll_seconds": poll_seconds,
-            }
         result = outlook_monitor.fetch_latest_otp(
             subject_patterns=OTP_SUBJECT_PATTERNS,
             code_regex=OTP_CODE_REGEX,
@@ -536,7 +440,7 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
         # OTP_FOLDER_NOT_FOUND:立刻 fail,不要再輪(設定錯了,繼續輪沒意義)
         if isinstance(result, dict) and result.get("code") == "OTP_FOLDER_NOT_FOUND":
             return result
-        # 已超過 deadline → 跳出
+        # 已超過 deadline(poll_seconds<=0 時第一次就會命中這裡)→ 跳出
         if time.monotonic() >= deadline:
             break
         # 否則 sleep 後再撈
@@ -668,8 +572,8 @@ def _warmup_outlook() -> None:
       3. GetActiveObject → fallback Dispatch 取 Outlook Application proxy
       4. session.Folders.Count 觸發完整 proxy 鏈(stores list)
 
-    不列 Inbox items(那是 main thread 的事,避免跟 OutlookMonitor 搶)。所有錯誤吞
-    掉 — warmup 失敗不該 crash native host,後續 fetch_latest_otp fallback 還能救,
+    不列 Inbox items(那是 fetch_latest_otp 真正查詢時的事)。所有錯誤吞
+    掉 — warmup 失敗不該 crash native host,後續 fetch_latest_otp 還能救,
     或回 OUTLOOK_UNAVAILABLE 給 caller。
     """
     try:

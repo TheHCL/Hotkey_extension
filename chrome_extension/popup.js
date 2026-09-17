@@ -250,8 +250,8 @@ async function onCaptchaClick() {
 //   1. user 在 OTP 頁打開 extension → detectOtpOnTab 問 content script
 //      「有沒有 otpBox 多格輸入?」→ 有就顯示按鈕
 //   2. user 按按鈕 → onOtpClick 先問 background 要 OTP code
-//   3. background → native host → 讀 cache(PWmgr GUI monitor 寫的)或
-//      fallback on-demand 查 Outlook
+//   3. background → native host → on-demand 直接查 Outlook(沒有背景常駐監聽 /
+//      沒有 cache,按按鈕當下才查)
 //   4. 拿到 code 後請 background 轉發給 content script → 填入
 //
 // 兩個獨立 round trip 是刻意的:不要把 native host 的 token 暴露給 content script,
@@ -299,13 +299,13 @@ async function onOtpClick() {
       const err = (otpResp && otpResp.error) || "";
       if (code === "NO_CODE") {
         const attempts = otpResp.attempts || 1;
-        setStatus(`OTP ${OTP_POLL_SECONDS}s 內沒找到(輪 ${attempts} 次),請到 PWmgr GUI「OTP 監聽設定」確認 folder 是否正確`);
+        setStatus(`OTP ${OTP_POLL_SECONDS}s 內沒找到(輪 ${attempts} 次),請到 PWmgr GUI「OTP 設定」確認 folder 是否正確`);
       } else if (code === "OTP_FOLDER_NOT_FOUND") {
-        setStatus(`OTP folder 設錯了:${err} — 請到 PWmgr GUI「OTP 監聽設定」重設`);
+        setStatus(`OTP folder 設錯了:${err} — 請到 PWmgr GUI「OTP 設定」重設`);
       } else if (code === "OUTLOOK_UNAVAILABLE" || code === "PYWIN32_MISSING") {
         setStatus(`Outlook 無法使用(${err}),請確認 Outlook 已開 + PWmgr 常駐`);
       } else if (code === "OTP_DISABLED") {
-        setStatus("OTP 監聽已停用,請到 PWmgr GUI「OTP 監聽設定」啟用");
+        setStatus("OTP 自動填入已停用,請到 PWmgr GUI「OTP 設定」啟用");
       } else if (code === "EXCEPTION") {
         setStatus(`background 例外:${err}(看 chrome://extensions > service worker console)`);
       } else if (code === "EMPTY") {
@@ -355,7 +355,7 @@ async function onOtpClick() {
   }
 }
 
-// --- OTP folder picker 已搬到 PWmgr GUI 的「OTP 監聽設定」dialog ---
+// --- OTP folder picker 已搬到 PWmgr GUI 的「OTP 設定」dialog ---
 // (popup.js 不再做 picker UI。background.js 的 listOtpFolders / setOtpFolder
 //  handler 也不再需要,但保留 dispatch entry 避免 native host 端 dispatch table
 //  對不上 — 兩端都標 deprecate,後續版本可移除。)
