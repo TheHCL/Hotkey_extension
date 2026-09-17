@@ -44,7 +44,7 @@ class TrayIcon:
         self.is_otp_enabled = is_otp_enabled
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
-        # OTP 監聽 toggle 在 menu 是 checkable item;toggle 後 caller 透過
+        # OTP 開關在 menu 是 checkable item;toggle 後 caller 透過
         # update_menu() 重新跑 Menu 建構,讓 checked 狀態刷新(避免 menu
         # 凍結後狀態卡住)。pystray 沒有 in-place update checked 的 API。
         self._show_otp_toggle = on_toggle_otp is not None and is_otp_enabled is not None
@@ -91,7 +91,7 @@ class TrayIcon:
             # (那是更舊版本的簽章)。寫成單參數避免 TypeError。
             items.append(
                 pystray.MenuItem(
-                    "OTP 監聽",
+                    "OTP 自動填入",
                     self._toggle_otp,
                     checked=lambda _item: bool(self.is_otp_enabled()),
                 )

@@ -32,14 +32,6 @@ def current_url_path() -> Path:
     return app_dir() / "current_url.json"
 
 
-def otp_cache_path() -> Path:
-    """Outlook OTP 快取檔(PWmgr GUI 的 outlook_monitor 寫,native host 讀)。
-
-    與 current_url.json 同一目錄(LOCALAPPDATA\\pwmgr)。
-    """
-    return app_dir() / "otp_cache.json"
-
-
 # --- 安裝路徑 ---------------------------------------------------------------
 
 # 專案根目錄。
@@ -83,13 +75,13 @@ HOTKEY_MODIFIERS = 0x0002 | 0x0004  # MOD_CONTROL | MOD_SHIFT
 HOTKEY_KEY = ord("L")
 HOTKEY_ID = 1
 
-# --- OTP 自動填(Outlook 監聽) ----------------------------------------------------
+# --- OTP 自動填(lazy on-demand 查 Outlook,沒有背景監聽) ------------------------
 
-# OTP 快取有效期:超過此秒數視為過期,native host get_otp 不會回傳
+# OTP 有效期:超過此秒數視為過期,native host get_otp 不會回傳
 # 10 分鐘 — Dell OTP 一般 5 分鐘內有效,但保險一點
 OTP_CACHE_TTL_SECONDS = 600
 
-# Outlook 監聽的 subject pattern 列表(任一包含即視為 OTP 信)
+# 要查詢的 subject pattern 列表(任一包含即視為 OTP 信)
 # 後續可擴充其他站的 OTP 信(目前先針對 Dell)
 # 注意:Dell 對不同語系網域發的 OTP 信件 subject 會用當地語系(中文網域 →「一次性密碼」,
 # 英文網域 → "One-time Password"),所以 pattern 兩種都列,regex 配 IGNORECASE。
@@ -102,9 +94,6 @@ OTP_SUBJECT_PATTERNS: list[str] = [
 
 # 從信件 body 抽出 OTP code 的 regex。\b word boundary 避免 7 位電話誤判
 OTP_CODE_REGEX: str = r"\b(\d{6})\b"
-
-# on-demand query fallback 翻 Inbox 時最多看幾封(避免掃整個 mailbox 卡住)
-OTP_LOOKBACK_COUNT = 20
 
 # --- Python 路徑(給 .bat 與安裝腳本) ----------------------------------------
 

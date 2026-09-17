@@ -3,7 +3,7 @@
 跟 ``pwmgr.config`` 不同:config 是 module-load 時的常數(路徑、上限、預設值);
 settings 是 user 可在 GUI 改的執行期設定,存到 ``LOCALAPPDATA\\pwmgr\\settings.json``。
 
-目前放 OTP 相關設定(主開關 + 訂閱 store 清單)。設計為一般化 dict,
+目前放 OTP 相關設定(主開關 + 目標 folder)。設計為一般化 dict,
 之後要加新設定在這裡擴充就好。
 """
 
@@ -23,24 +23,12 @@ _settings_lock = threading.Lock()
 
 # --- 預設值 ------------------------------------------------------------------
 
-# OTP 主開關預設 OFF(lazy mode)— Outlook 不會被 PWmgr background monitor thread
-# 持續 polling 卡頓,只有按 extension「取得 OTP 驗證碼」才戳 Outlook(poll 15 秒內
-# 拿到就停、沒拿到也停)。
-#
-# User 想恢復 background monitor(按按鈕秒回、cache 預熱)→ 到 GUI「OTP 監聽設定」
-# 勾選「啟用 OTP 監聽」即可。
-#
-# 為什麼改 OFF:Outlook 2019 中文版 + Exchange 信箱背景 polling 會讓 Outlook UI
-# 卡頓(每秒 round-trip 一次)。Lazy 預設讓 SA(這個 user)跟新裝 user 不踩這個坑。
-# 既有 user 的 settings.json 已經存了 otp_enabled 值不會被 default 影響。
+# OTP 主開關預設 OFF——只有按 extension「取得 OTP 驗證碼」才會查 Outlook
+# (查 poll_seconds 秒內拿到就停、沒拿到也停),不會有任何背景常駐監聽。
+# User 想使用 OTP 自動填入 → 到 GUI「OTP 設定」勾選「啟用 OTP 自動填入」即可。
 DEFAULT_OTP_ENABLED: bool = False
 
-# None = 自動偵測(Exchange mailbox @開頭 + Outlook profile)
-# []  = 不訂閱任何 store(等同關閉 OTP monitor)
-# ["storeA", "storeB"] = 只訂閱這些 store
-DEFAULT_OTP_SUBSCRIBED_STORES: list[str] | None = None
-
-# OTP 監聽的目標 folder 路徑(由 user 從 GUI「OTP 監聽設定」選擇)。
+# OTP 查詢的目標 folder 路徑(由 user 從 GUI「OTP 設定」選擇)。
 # None = 走原本的預設行為(每個 store 的 Inbox)。
 # "your-email@your-domain.com/Inbox/Dell OTP" = 只掃這個 folder,不遞迴全 subfolder。
 # 路徑格式:`<store name>/<subfolder path>`,subfolder 用 `/` 分隔。
@@ -80,7 +68,7 @@ def save_settings(data: dict[str, Any]) -> None:
 
 
 def get_otp_enabled() -> bool:
-    """讀 OTP 主開關。預設 ON。"""
+    """讀 OTP 主開關。預設 OFF。"""
     return bool(load_settings().get("otp_enabled", DEFAULT_OTP_ENABLED))
 
 
@@ -91,25 +79,8 @@ def set_otp_enabled(enabled: bool) -> None:
     save_settings(data)
 
 
-def get_otp_subscribed_stores() -> list[str] | None:
-    """讀目前設定中的 OTP 訂閱 store 清單;若無設定就回 None(自動偵測)。
-
-    回傳值:
-      - None:自動偵測(預設)
-      - list[str]:user 指定要訂閱的 store 名稱
-    """
-    return load_settings().get("otp_subscribed_stores", DEFAULT_OTP_SUBSCRIBED_STORES)
-
-
-def set_otp_subscribed_stores(stores: list[str] | None) -> None:
-    """寫 OTP 訂閱 store 清單。None 表示回到自動偵測。"""
-    data = load_settings()
-    data["otp_subscribed_stores"] = stores
-    save_settings(data)
-
-
 def get_otp_target_folder() -> str | None:
-    """讀 OTP 監聽的目標 folder 路徑。None 表示走預設行為(掃每個 store 的 Inbox)。
+    """讀 OTP 查詢的目標 folder 路徑。None 表示走預設行為(掃每個 store 的 Inbox)。
 
     路徑格式:`<store name>/<subfolder path>`,例如
     `"your-email@your-domain.com/Inbox/Dell OTP"`。
@@ -122,7 +93,7 @@ def get_otp_target_folder() -> str | None:
 
 
 def set_otp_target_folder(path: str | None) -> None:
-    """寫 OTP 監聽的目標 folder 路徑。None 或空字串表示清掉(回預設行為)。"""
+    """寫 OTP 查詢的目標 folder 路徑。None 或空字串表示清掉(回預設行為)。"""
     data = load_settings()
     if path is None or not str(path).strip():
         # 移除這個 key,讓讀取時走 DEFAULT
