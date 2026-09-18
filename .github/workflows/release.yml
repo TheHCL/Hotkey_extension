@@ -16,6 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify pwmgr/version.py matches the tag
+        # 自動更新檢查是拿 pwmgr.version.__version__(打包進 PWmgr.exe)跟 GitHub
+        # Release 的 tag_name 比對——兩者沒對齊,已安裝的 client 會永遠偵測不到
+        # 這個新版本。這裡擋在最前面,對不上就直接 fail,不用等後面建置/測試跑完。
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $fileVersion = (Select-String -Path pwmgr/version.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tagVersion -ne $fileVersion) {
+            Write-Error "pwmgr/version.py 是 '$fileVersion',但 tag 是 '${{ github.ref_name }}'(去掉 v = '$tagVersion')。請先更新 pwmgr/version.py 再打 tag。"
+            exit 1
+          }
+          Write-Host "OK: pwmgr/version.py ($fileVersion) matches tag (${{ github.ref_name }})"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

@@ -1,9 +1,10 @@
-"""PyInstaller 進入點 — 打包成 PWmgrSetup.exe(console,互動式安裝/解除安裝)。
+"""PyInstaller 進入點 — 打包成 PWmgrSetup.exe(console,互動式安裝/解除安裝/更新)。
 
-在新電腦上取代 `python install.py` / `python uninstall.py`,不需要對方裝 Python。
-用法:
+在新電腦上取代 `python install.py` / `python uninstall.py` / `python update.py`,
+不需要對方裝 Python。用法:
     PWmgrSetup.exe              等同 python install.py
     PWmgrSetup.exe --uninstall  等同 python uninstall.py
+    PWmgrSetup.exe --update     等同 python update.py
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if __name__ == "__main__":
     if "--uninstall" in sys.argv:
         from uninstall import main
+    elif "--update" in sys.argv:
+        from update import main
     else:
         from install import main
     sys.exit(main())

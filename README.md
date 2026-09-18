@@ -11,12 +11,13 @@
 1. [功能](#功能)
 2. [架構](#架構)
 3. [安裝](#安裝)
-4. [使用](#使用)
-5. [瀏覽器擴充功能](#瀏覽器擴充功能)
-6. [風險與限制](#風險與限制)
-7. [疑難排解](#疑難排解)
-8. [解除安裝](#解除安裝)
-9. [開發](#開發)
+4. [更新](#更新)
+5. [使用](#使用)
+6. [瀏覽器擴充功能](#瀏覽器擴充功能)
+7. [風險與限制](#風險與限制)
+8. [疑難排解](#疑難排解)
+9. [解除安裝](#解除安裝)
+10. [開發](#開發)
 
 ---
 
@@ -140,6 +141,24 @@ python packaging\build.py
 
 > ⚠️ **若公司 GPO 鎖住開發人員模式**:擴充功能無法載入,整個瀏覽器整合會失效。
 > 但 **GUI 本身仍完全可用**,等於降級為「手動複製密碼」的本機密碼庫。
+
+---
+
+## 更新
+
+僅適用「打包成 exe 分發」的安裝方式(見上方[打包成 exe 分發](#打包成-exe-分發另一台電腦不用裝-python))。
+
+- **自動檢查**:GUI 啟動後會在背景檢查一次 GitHub 上有沒有新版本,之後每 24 小時最多檢查一次(不會每次開機都打 API)。發現新版本時**不會彈窗打斷你**,只會跳 tray 氣泡通知,提醒到「說明 → 檢查更新」安裝。
+- **手動檢查**:GUI 選單「說明 → 檢查更新...」,隨時可以手動觸發,有沒有新版本都會跳對話框告知。
+- **一鍵更新**:對話框按「是」後,GUI 會呼叫同資料夾裡的 `PWmgrSetup.exe --update`,自己結束;`PWmgrSetup.exe` 會下載最新版 zip、備份舊的 `PWmgr.exe` / `_internal\` / `chrome_extension\`、換上新版,再自動重啟 GUI。因為 Chrome/Edge 未封裝擴充的 Extension ID 是依資料夾路徑算的,原地換內容不會變 ID,**不需要重新載入擴充功能或重跑安裝**。
+- **命令列手動更新**:也可以自己開命令提示字元執行(雙擊沒辦法帶參數,跟[解除安裝](#解除安裝)一樣):
+
+  ```bat
+  PWmgrSetup.exe --update
+  ```
+
+- **開發模式(`python -m pwmgr`)**:沒有 exe 可以自動替換,「檢查更新」只會告知有新版本並開啟瀏覽器到 Release 頁,請改用 `git pull`。
+- `PWmgrSetup.exe` 本身不會自我更新(它變動頻率遠低於程式邏輯);如果它自己需要換版,請手動重新下載。
 
 ---
 
@@ -345,6 +364,7 @@ pytest tests/ -v
 
 **Release**(`.github/workflows/release.yml`)
 
+- **打 tag 前務必先把 `pwmgr/version.py` 的 `__version__` 改成跟即將打的 tag 一致**(例如要打 `v1.1.0`,`__version__` 要是 `"1.1.0"`)。這個版本字串會被打包進 `PWmgr.exe`,是 GUI [自動更新檢查](#更新)拿來跟 GitHub Release 的 `tag_name` 比對的依據——沒對齊,已安裝的 client 會永遠偵測不到這個新版本。CI 第一步就會檢查兩者是否一致,對不上直接 fail、不會往下跑建置。
 - 觸發時機:push `v*.*.*` 格式的 tag。
 - 步驟:跑測試(同上,含 Tcl/Tk 重跑機制)→ `python packaging/build.py`
   產生 `PWmgr.exe` + `PWmgrSetup.exe` → 把 `dist/PWmgr/` 連同
@@ -374,6 +394,9 @@ pytest tests/ -v
 | `pwmgr/matcher.py` | URL 正規化與比對 |
 | `pwmgr/ipc.py` | 跨行程檔案鎖(msvcrt / fcntl) |
 | `pwmgr/config.py` | 路徑與常數集中管理(含 frozen/exe 判斷) |
+| `pwmgr/version.py` | 單一版本來源(`__version__`),release 前需跟 tag 對齊 |
+| `pwmgr/updater.py` | 查詢 GitHub 最新 Release,跟 `__version__` 比對 |
+| `update.py` | `PWmgrSetup.exe --update` 的實際流程:下載/備份/替換/重啟 |
 | `packaging/build.py` | 跑 PyInstaller,產生 `dist\PWmgr.exe` + `dist\PWmgrSetup.exe` |
 | `packaging/entry_gui.py` | `PWmgr.exe` 的 PyInstaller 進入點 |
 | `packaging/entry_setup.py` | `PWmgrSetup.exe` 的 PyInstaller 進入點 |
@@ -385,6 +408,7 @@ pytest tests/ -v
 - `tests/test_native_host.py` — stdin/stdout 模擬,所有訊息類型 + 錯誤路徑、`get_group_colors` / `set_group_color` handler
 - `tests/test_app_smoke.py` — GUI 構造 / 載入 / 搜尋 / 高亮 / 群組選色對話框
 - `tests/test_extension_manifest.py` — manifest 完整性、`popup.js` 必要 token(含 group_colors 覆寫相關)
+- `tests/test_updater.py` — 更新檢查的版本比對、asset URL 挑選、各種失敗路徑(網路/JSON/找不到 asset)均回傳 `None` 不拋例外
 
 ### 手動 smoke test
 

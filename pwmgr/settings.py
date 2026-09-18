@@ -101,3 +101,18 @@ def set_otp_target_folder(path: str | None) -> None:
     else:
         data["otp_target_folder"] = str(path).strip()
     save_settings(data)
+
+
+def get_update_last_check_ts() -> float:
+    """讀上次背景更新檢查的 unix timestamp。預設 0(從未檢查過)。"""
+    try:
+        return float(load_settings().get("update_last_check_ts", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_update_last_check_ts(ts: float) -> None:
+    """寫上次背景更新檢查的 unix timestamp。"""
+    data = load_settings()
+    data["update_last_check_ts"] = float(ts)
+    save_settings(data)
