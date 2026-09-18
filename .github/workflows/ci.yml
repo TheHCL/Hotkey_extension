@@ -32,4 +32,4 @@ jobs:
         # 短暫鎖住 tcl/tk 的 library 檔案(疑似 Windows Defender 即時掃描),
         # 導致 _tkinter.TclError: Can't find a usable init.tcl/tk.tcl。
         # 只針對這個特定例外重跑,真正的邏輯錯誤(AssertionError 等)不會被蓋過。
-        run: pytest tests/ -v --reruns 2 --reruns-delay 1 --only-rerun "_tkinter.TclError"
+        run: pytest tests/ -v --reruns 2 --reruns-delay 1 --only-rerun "TclError"
