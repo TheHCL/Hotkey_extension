@@ -321,13 +321,44 @@ pytest tests/ -v
 
 ### CI/CD
 
-- **CI**(`.github/workflows/ci.yml`)— push / PR 到 `main` 時,在 `windows-latest` 跑 `pytest tests/ -v`。
-  之所以指定 Windows runner,是因為 `pwmgr/hotkey.py` 在 import 時就呼叫
-  `ctypes.WinDLL("user32")`,`test_app_smoke.py` 因此只能在 Windows 上跑。
-- **Release**(`.github/workflows/release.yml`)— push `v*.*.*` tag 時觸發:
-  跑測試 → `python packaging/build.py` 產生 `PWmgr.exe` + `PWmgrSetup.exe` →
-  把 `dist/PWmgr/` 連同 `chrome_extension/` 一起打包成 zip → 建立 GitHub Release
-  並附上 `PWmgr-<tag>.zip`、`PWmgrSetup.exe` 兩個檔案。
+兩條 GitHub Actions workflow,皆跑在 `windows-latest`——因為 `pwmgr/hotkey.py`
+在 import 時就呼叫 `ctypes.WinDLL("user32")`,`test_app_smoke.py` 裡建構
+`tk.Tk()` 的 GUI 測試因此只能在真的 Windows 上跑(Linux 上連 import 都會炸)。
+
+**CI**(`.github/workflows/ci.yml`)
+
+- 觸發時機:push / PR 到 `main`。
+- 步驟:`pip install -r requirements-dev.txt` → `pytest tests/ -v`。
+- 已知的 runner 間歇性問題:`windows-latest` 在這個測試套件快速連續建立/銷毀
+  多個 `tk.Tk()` 時,偶爾會短暫鎖住 tcl/tk 的 library 檔案(疑似 Windows
+  Defender 即時掃描造成),噴出 `_tkinter.TclError`(找不到 `init.tcl` /
+  `tk.tcl` 之類的檔案,但同一個檔案前一刻才讀取成功)。這不是程式或測試的
+  bug,重跑就會過。因此加了 `pytest-rerunfailures`,只針對這個例外類別
+  自動重跑(`--reruns 2 --reruns-delay 1 --only-rerun "TclError"`)——
+  真正的邏輯錯誤(`AssertionError` 等)完全不受影響,第一次失敗就會照常
+  回報,不會被這個機制蓋過。
+  - 注意:`--only-rerun` 比對的是 `pytest-rerunfailures` 內部組出的
+    `f"{type(exc).__name__}: {exc}"`,`type(exc).__name__` 對
+    `_tkinter.TclError` 而言只有裸類別名 `TclError`(沒有 `_tkinter.`
+    模組前綴)——這是本輪除錯踩過的坑,選 pattern 時要注意。
+- 設有 `timeout-minutes: 15`,避免真的卡住時無限燒 CI 分鐘數。
+
+**Release**(`.github/workflows/release.yml`)
+
+- 觸發時機:push `v*.*.*` 格式的 tag。
+- 步驟:跑測試(同上,含 Tcl/Tk 重跑機制)→ `python packaging/build.py`
+  產生 `PWmgr.exe` + `PWmgrSetup.exe` → 把 `dist/PWmgr/` 連同
+  `chrome_extension/` 一起打包成 `PWmgr-<tag>.zip` → 建立 GitHub Release,
+  附上 `PWmgr-<tag>.zip` 與 `PWmgrSetup.exe` 兩個檔案。已用測試 tag
+  端到端驗證過整條流程(build → package → publish 全綠,zip 內容含
+  `PWmgr.exe`、`_internal/`、`chrome_extension/`)。
+- `packaging/build.py` 結束時會印中文狀態訊息;`windows-latest` 上
+  Python 的 stdout 沒接真的 console,預設會落到系統 `cp1252` codepage,
+  印中文字會 `UnicodeEncodeError`。只在「Build PWmgr.exe + PWmgrSetup.exe」
+  這個 step 設 `PYTHONIOENCODING: utf-8`(只影響 stdout/stderr 編碼)。
+  **不要**改設整個 job 共用的 `PYTHONUTF8`——那個環境變數連 Windows 檔案系統
+  編碼行為都會改,會害 tkinter 找不到 `init.tcl`(這也是本輪踩過的坑)。
+- 同樣設有 `timeout-minutes: 20`。
 
 ### 模組總覽
 
