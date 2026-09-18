@@ -384,7 +384,7 @@ pytest tests/ -v
 
 | 模組 | 職責 |
 |------|------|
-| `pwmgr/__main__.py` | 入口分流:`-m pwmgr` → GUI;`-m pwmgr --native` → Chrome 主機 |
+| `pwmgr/__main__.py` | 入口分流:`-m pwmgr` → GUI;`-m pwmgr --native` → Chrome 主機;`-m pwmgr --show-logs` → 開 log 資料夾 |
 | `pwmgr/app.py` | Tk GUI + URL 輪詢 + 剪貼簿管理 |
 | `pwmgr/hotkey.py` | Win32 `RegisterHotKey` 全域熱鍵 |
 | `pwmgr/tray.py` | pystray 系統列圖示 |
@@ -394,6 +394,7 @@ pytest tests/ -v
 | `pwmgr/matcher.py` | URL 正規化與比對 |
 | `pwmgr/ipc.py` | 跨行程檔案鎖(msvcrt / fcntl) |
 | `pwmgr/config.py` | 路徑與常數集中管理(含 frozen/exe 判斷) |
+| `pwmgr/logging_setup.py` | Rotating file log(`%LOCALAPPDATA%\pwmgr\logs\pwmgr.log`)+ 未捕捉例外/Tk callback 例外接管,dev 排查 fail 用 |
 | `pwmgr/version.py` | 單一版本來源(`__version__`),release 前需跟 tag 對齊 |
 | `pwmgr/updater.py` | 查詢 GitHub 最新 Release,跟 `__version__` 比對 |
 | `update.py` | `PWmgrSetup.exe --update` 的實際流程:下載/備份/替換/重啟 |

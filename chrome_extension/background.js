@@ -406,6 +406,39 @@ function onNativeMessage(_msg) {
   // 原生主機主動推的訊息目前用不到(只 query 與 report_url 都是 client→host)
 }
 
+// --- 錯誤回報(fail log) -----------------------------------------------------
+//
+// background(MV3 service worker)閒置會被 Chrome 直接砍掉、popup 的 DevTools
+// console 一關就跟著消失,平常這兩處的未捕捉例外幾乎沒辦法回頭查。這裡把它們
+// 轉送給 native host,併進同一份 pwmgr.log(見 native_host._handle_report_error),
+// dev 開 log 資料夾就能同時看到 Python + extension 兩邊的失敗紀錄。
+//
+// Fire-and-forget:回報失敗(例如 native host 還沒連上)不重試、不擋任何流程,
+// log 本來就只是輔助診斷用。
+
+function reportError(source, message, stack, url) {
+  try {
+    sendNative({
+      type: "report_error",
+      source,
+      message: String(message || ""),
+      stack: stack || null,
+      url: url || null,
+    });
+  } catch (_) {
+    // 連 sendNative 都丟例外(理論上不會,它自己包 try/catch)就放棄,
+    // 避免錯誤回報本身變成新的未捕捉例外來源。
+  }
+}
+
+self.addEventListener("error", (event) => {
+  reportError("background", event.message, event.error && event.error.stack);
+});
+self.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportError("background", String(reason && reason.message || reason), reason && reason.stack);
+});
+
 // --- Cold-start retry helper -----------------------------------------------
 //
 // Chrome MV3 service worker 是 event-driven:SW idle-kill 後第一次被觸發會 spawn 新
@@ -1059,6 +1092,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true, tabId: newTab.id });
     })();
     return true;
+  }
+
+  if (msg.type === "reportError") {
+    // popup / content script 沒有 nativePort,經 background 轉送給 native host。
+    reportError(msg.source, msg.message, msg.stack, msg.url);
+    sendResponse({ ok: true });
+    return false;
   }
 
   return false;

@@ -9,11 +9,14 @@ exe/dll。這裡刻意不用 ``requests``,專案目前沒有這個依賴,stdlib
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 from .version import __version__ as CURRENT_VERSION
+
+_logger = logging.getLogger(__name__)
 
 REPO = "TheHCL/Hotkey_extension"
 RELEASES_API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -74,8 +77,10 @@ def check_for_update(timeout: float = 5.0) -> UpdateInfo | None:
         release_url = str(data.get("html_url") or f"https://github.com/{REPO}/releases/latest")
 
         return UpdateInfo(version=latest_version, zip_url=zip_url, release_url=release_url)
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError, OSError):
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError, OSError) as e:
+        _logger.info("check_for_update 失敗(可能是網路問題): %s", e)
         return None
     except Exception:
         # 保底:更新檢查絕對不能讓呼叫端炸掉。
+        _logger.exception("check_for_update 未預期例外")
         return None

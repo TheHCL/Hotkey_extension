@@ -1,5 +1,28 @@
 // popup.js — 單一視窗,自動分支:命中時 autofill,未命中時 fallback 用 cascading 群組選單
 
+// popup 一失焦/被關掉就整個銷毀,DevTools console 跟著消失——平常這裡的例外
+// 幾乎沒辦法回頭查。轉送給 background(它有 nativePort)寫進 pwmgr.log。
+function reportError(message, stack) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "reportError",
+      source: "popup",
+      message: String(message || ""),
+      stack: stack || null,
+      url: location.href,
+    });
+  } catch (_) {
+    // extension context invalidated(popup 關閉中)等情況下放棄回報
+  }
+}
+window.addEventListener("error", (event) => {
+  reportError(event.message, event.error && event.error.stack);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportError(String(reason && reason.message || reason), reason && reason.stack);
+});
+
 const $conn = document.getElementById("conn");
 const $currentUrl = document.getElementById("current-url");
 const $matches = document.getElementById("matches");

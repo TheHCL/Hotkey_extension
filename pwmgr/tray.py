@@ -37,11 +37,13 @@ class TrayIcon:
         on_quit: Callable[[], None],
         on_toggle_otp: Callable[[], None] | None = None,
         is_otp_enabled: Callable[[], bool] | None = None,
+        on_open_logs: Callable[[], None] | None = None,
     ) -> None:
         self.on_show = on_show
         self.on_quit = on_quit
         self.on_toggle_otp = on_toggle_otp
         self.is_otp_enabled = is_otp_enabled
+        self.on_open_logs = on_open_logs
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
         # OTP 開關在 menu 是 checkable item;toggle 後 caller 透過
@@ -96,6 +98,8 @@ class TrayIcon:
                     checked=lambda _item: bool(self.is_otp_enabled()),
                 )
             )
+        if self.on_open_logs is not None:
+            items.append(pystray.MenuItem("開啟 Log 資料夾", self._open_logs))
         items.append(pystray.MenuItem("結束", self._quit))
         return pystray.Menu(*items)
 
@@ -124,3 +128,7 @@ class TrayIcon:
     def _toggle_otp(self, icon, item) -> None:
         if self.on_toggle_otp is not None:
             self.on_toggle_otp()
+
+    def _open_logs(self, icon, item) -> None:
+        if self.on_open_logs is not None:
+            self.on_open_logs()

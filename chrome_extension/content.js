@@ -26,6 +26,37 @@
 
   console.log("[pwmgr] CONTENT SCRIPT INJECTED at", Date.now(), "url=", location.href);
 
+  // content script 的 log 混在該網頁自己的 console 裡,頁面一 reload/導頁就沒了
+  // ——轉送給 background(它有 nativePort)寫進 pwmgr.log,才找得回來。
+  //
+  // 只回報「這支 content script 自己」的例外,不回報該網頁本身的 JS 錯誤:
+  // window 的 error/unhandledrejection 事件理論上不會跨 isolated world(content
+  // script 與頁面本身的 JS 是分開的執行環境),但保險起見仍用 filename/stack
+  // 是否含 chrome-extension:// 過濾一次,避免不小心把使用者瀏覽的網站自己的
+  // 錯誤內容送出去。
+  function reportError(message, stack, filename) {
+    if (filename && !String(filename).includes("chrome-extension://")) return;
+    if (!filename && stack && !String(stack).includes("chrome-extension://")) return;
+    try {
+      chrome.runtime.sendMessage({
+        type: "reportError",
+        source: "content",
+        message: String(message || ""),
+        stack: stack || null,
+        url: location.href,
+      });
+    } catch (_) {
+      // extension context invalidated(擴充功能重載中)等情況下放棄回報
+    }
+  }
+  window.addEventListener("error", (event) => {
+    reportError(event.message, event.error && event.error.stack, event.filename);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    reportError(String(reason && reason.message || reason), reason && reason.stack, null);
+  });
+
   if (window.__pwmgr_filling__) return; // 防止重複
   window.__pwmgr_filling__ = true;
 

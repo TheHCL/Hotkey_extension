@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import queue
 import subprocess
 import sys
@@ -27,6 +29,7 @@ from .config import (
     HOTKEY_MODIFIERS,
     URL_POLL_INTERVAL_MS,
     app_dir,
+    logs_dir,
 )
 from .hotkey import GlobalHotkey
 from .matcher import matches, registered_domain
@@ -34,6 +37,8 @@ from .models import PasswordEntry
 from .tray import TrayIcon
 from .updater import UpdateInfo
 from .version import __version__ as APP_VERSION
+
+_logger = logging.getLogger(__name__)
 
 # 背景自動檢查更新的間隔——避免每次啟動都打 GitHub API。
 UPDATE_AUTO_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
@@ -77,6 +82,10 @@ class PwmgrApp:
         self.root.configure(background=PALETTE["bg"])
         self._set_window_icon()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Tk 預設把 callback(按鈕/選單/事件綁定)裡的例外印到 stderr 就吞掉——
+        # 因為 GUI 用 pythonw.exe 跑(無 console),這些例外平常完全看不到。
+        # 接管後寫進 pwmgr.log,dev 才找得到「使用者按了什麼結果炸了」。
+        self.root.report_callback_exception = self._on_tk_callback_exception
 
         # 隱藏到 tray
         self._tray_visible = True  # 內部標記:目前視窗是否「應該」可見
@@ -89,6 +98,7 @@ class PwmgrApp:
             on_quit=self._quit_app,
             on_toggle_otp=self._toggle_otp_from_tray,
             is_otp_enabled=otp_settings.get_otp_enabled,
+            on_open_logs=self._open_logs_folder,
         )
 
         self._entries: list[PasswordEntry] = []
@@ -242,6 +252,7 @@ class PwmgrApp:
 
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="檢查更新...", command=self._check_for_updates_manual)
+        help_menu.add_command(label="開啟 Log 資料夾", command=self._open_logs_folder)
         help_menu.add_command(label="關於 PWmgr", command=self._show_about)
         menubar.add_cascade(label="說明", menu=help_menu)
 
@@ -1531,6 +1542,18 @@ class PwmgrApp:
             "OS 帳號登入即為認證;不另設主密碼。\n\n"
             f"資料目錄: {app_dir()}",
         )
+
+    # --- log --------------------------------------------------------------
+
+    def _on_tk_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        """接管 Tk 的未捕捉 callback 例外(按鈕/選單/事件綁定裡發生的),寫進 pwmgr.log。"""
+        _logger.error("Tk callback 未捕捉例外", exc_info=(exc_type, exc_value, exc_tb))
+
+    def _open_logs_folder(self) -> None:
+        try:
+            os.startfile(logs_dir())  # type: ignore[attr-defined]  # Windows-only
+        except Exception as e:
+            messagebox.showerror("開啟失敗", f"{type(e).__name__}: {e}")
 
     # --- mainloop ------------------------------------------------------------
 

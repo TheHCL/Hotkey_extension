@@ -10,12 +10,14 @@ settings 是 user 可在 GUI 改的執行期設定,存到 ``LOCALAPPDATA\\pwmgr\
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any
 
 from .config import app_dir
 
+_logger = logging.getLogger(__name__)
 
 SETTINGS_PATH: Path = app_dir() / "settings.json"
 _settings_lock = threading.Lock()
@@ -63,8 +65,8 @@ def save_settings(data: dict[str, Any]) -> None:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             tmp.replace(SETTINGS_PATH)
-        except Exception as e:
-            print(f"[pwmgr][settings] save 失敗: {e}")
+        except Exception:
+            _logger.exception("save_settings 失敗")
 
 
 def get_otp_enabled() -> bool:

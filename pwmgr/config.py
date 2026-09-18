@@ -32,6 +32,18 @@ def current_url_path() -> Path:
     return app_dir() / "current_url.json"
 
 
+def logs_dir() -> Path:
+    """回傳 log 目錄並確保其存在。GUI 與 native host 共用同一份 log 檔。"""
+    d = app_dir() / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# rotating log 檔大小上限與備份數量——避免 log 無限長大
+LOG_FILE_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+LOG_BACKUP_COUNT = 3
+
+
 # --- 安裝路徑 ---------------------------------------------------------------
 
 # 專案根目錄。
