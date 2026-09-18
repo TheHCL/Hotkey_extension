@@ -16,9 +16,12 @@ Outlook COM,其餘時間完全不干擾。
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 try:
     import win32com.client  # type: ignore
@@ -27,6 +30,25 @@ try:
     _HAS_PYWIN32 = True
 except ImportError:  # 非 Windows / 沒裝 pywin32(只在 requirements 標 win32)
     _HAS_PYWIN32 = False
+
+
+# 已知的暫時性 COM 錯誤——Outlook 主 thread 忙碌(例如正在處理彈窗/使用者輸入)時
+# 會拒絕外部 COM 呼叫,不代表真正的失敗。_handle_get_otp 的 poll 迴圈本來就會
+# 重試,通常下一次就成功(見 native_host._handle_get_otp)。這類錯誤只降級記
+# WARNING、不留完整 traceback,避免每次重試都在 log 留一份 stack trace,把真正
+# 需要 dev 注意的失敗埋掉。
+_TRANSIENT_COM_HRESULTS = {-2147418111}  # RPC_E_CALL_REJECTED:「接收者已拒絕這個呼叫」
+
+
+def _is_transient_com_error(e: Exception) -> bool:
+    return type(e).__name__ == "com_error" and bool(getattr(e, "args", None)) and e.args[0] in _TRANSIENT_COM_HRESULTS
+
+
+def _log_fetch_failure(context: str, e: Exception) -> None:
+    if _is_transient_com_error(e):
+        _logger.warning("%s 暫時性 COM 錯誤(Outlook 忙碌中,重試通常會成功):%s", context, e)
+    else:
+        _logger.exception("%s 失敗", context)
 
 
 # --- 預設 pattern --------------------------------------------------------------
@@ -280,6 +302,7 @@ def fetch_latest_otp(
                 except Exception:
                     pass
     except Exception as e:
+        _log_fetch_failure("fetch_latest_otp", e)
         return {
             "ok": False,
             "code": "OUTLOOK_UNAVAILABLE",
@@ -507,6 +530,7 @@ def list_otp_candidate_folders(
             scan_stats.append(f"walk stores 失敗:{e}")
         return {"ok": True, "folders": out, "scan_stats": scan_stats}
     except Exception as e:
+        _log_fetch_failure("list_otp_candidate_folders", e)
         return {
             "ok": False,
             "code": "OUTLOOK_UNAVAILABLE",

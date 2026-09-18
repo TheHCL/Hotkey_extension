@@ -97,6 +97,30 @@ def test_ping(isolated, fake_keyring) -> None:
     assert _read_message(io.BytesIO(out)) == {"ok": True, "pong": True}
 
 
+def test_report_error_writes_to_log(isolated, fake_keyring, caplog) -> None:
+    with caplog.at_level("ERROR", logger="pwmgr.native_host"):
+        out = _drive_loop(
+            _encode_message(
+                {
+                    "type": "report_error",
+                    "source": "popup",
+                    "message": "boom",
+                    "stack": "Error: boom\n  at x (popup.js:1:1)",
+                    "url": "chrome-extension://abc/popup.html",
+                }
+            )
+        )
+    assert _read_message(io.BytesIO(out)) == {"ok": True}
+    assert any("[extension:popup]" in r.message and "boom" in r.message for r in caplog.records)
+
+
+def test_report_error_requires_source(isolated, fake_keyring) -> None:
+    out = _drive_loop(_encode_message({"type": "report_error", "message": "boom"}))
+    resp = _read_message(io.BytesIO(out))
+    assert resp["ok"] is False
+    assert resp["code"] == "BAD_REQUEST"
+
+
 def test_save_then_list(isolated, fake_keyring) -> None:
     msgs = b"".join(
         [

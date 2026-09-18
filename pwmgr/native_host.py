@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import struct
 import sys
@@ -37,6 +38,8 @@ from .config import (
     OTP_SUBJECT_PATTERNS,
 )
 from .models import PasswordEntry
+
+_logger = logging.getLogger(__name__)
 
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # 允許的 captcha 答案字元:小寫字母 + 數字(實務常見)
@@ -216,6 +219,28 @@ def _handle_report_url(req: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_ping(_req: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "pong": True}
+
+
+def _handle_report_error(req: dict[str, Any]) -> dict[str, Any]:
+    """Chrome extension(background/popup/content)回報未捕捉例外,寫進 pwmgr.log。
+
+    Extension 端的錯誤平常幾乎看不到——MV3 service worker 閒置會被 Chrome
+    直接砍掉,popup 的 DevTools 一關就跟著消失。併進同一份 log,dev 開 log
+    資料夾就能同時看到 Python 與 extension 兩邊的失敗紀錄。
+    """
+    source = req.get("source")
+    if not isinstance(source, str) or not source:
+        raise BadRequestError("source 必須是字串")
+    message = str(req.get("message", ""))
+    stack = req.get("stack")
+    url = req.get("url")
+    detail = message
+    if isinstance(url, str) and url:
+        detail += f" (url={url})"
+    if isinstance(stack, str) and stack:
+        detail += f"\n{stack}"
+    _logger.error("[extension:%s] %s", source, detail)
+    return {"ok": True}
 
 
 def _handle_get_group_colors(_req: dict[str, Any]) -> dict[str, Any]:
@@ -425,7 +450,9 @@ def _handle_get_otp(req: dict[str, Any]) -> dict[str, Any]:
         # 命中就 return(成功)
         if isinstance(result, dict) and result.get("ok"):
             if attempt > 1:
-                print(f"[pwmgr][otp] poll 命中(第 {attempt} 次,{poll_seconds}s 內)")
+                # 注意:不能用 print() —— stdout 是 native messaging 的二進位
+                # 協定通道(見 _write_message),寫文字進去會汙染訊息格式。
+                _logger.info("OTP poll 命中(第 %d 次,%.0fs 內)", attempt, poll_seconds)
             return {
                 "ok": True,
                 "code": str(result.get("code", "")),
@@ -513,6 +540,7 @@ _DISPATCH: dict[str, Any] = {
     "get_otp": _handle_get_otp,
     "list_otp_folders": _handle_list_otp_folders,
     "set_otp_folder": _handle_set_otp_folder,
+    "report_error": _handle_report_error,
 }
 
 
@@ -628,8 +656,9 @@ def run() -> int:
             except Exception:
                 return 1
             continue
-        except Exception as e:
+        except Exception:
             # 無法恢復的 I/O 錯誤
+            _logger.exception("讀取 stdin 失敗,native host 結束")
             return 1
 
         if req is None:
@@ -653,9 +682,14 @@ def run() -> int:
         except storage.BadRequestError as e:
             resp = NativeHostError("BAD_REQUEST", str(e)).to_dict()
         except Exception as e:
+            # 不記錄 req 全文——可能含明文密碼,只記訊息 type 方便定位。
+            _logger.exception(
+                "dispatch 未預期例外 (type=%s)", req.get("type") if isinstance(req, dict) else req
+            )
             resp = NativeHostError("INTERNAL", f"{type(e).__name__}: {e}").to_dict()
 
         try:
             _write_message(stdout, resp)
         except Exception:
+            _logger.exception("寫回 stdout 失敗,native host 結束")
             return 1
