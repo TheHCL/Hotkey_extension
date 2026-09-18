@@ -19,7 +19,7 @@ from tkinter import font as tkfont
 from typing import Any
 from urllib.parse import urlparse
 
-from . import settings as otp_settings, storage
+from . import settings as otp_settings, storage, updater
 from .config import (
     CLIPBOARD_CLEAR_SECONDS,
     EXTENSION_DIR,
@@ -32,6 +32,11 @@ from .hotkey import GlobalHotkey
 from .matcher import matches, registered_domain
 from .models import PasswordEntry
 from .tray import TrayIcon
+from .updater import UpdateInfo
+from .version import __version__ as APP_VERSION
+
+# 背景自動檢查更新的間隔——避免每次啟動都打 GitHub API。
+UPDATE_AUTO_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 
 APP_TITLE = "PWmgr — 本機密碼管理員"
 
@@ -101,6 +106,8 @@ class PwmgrApp:
 
         # 啟動時先縮到 tray(熱鍵顯示)
         self.root.after(200, self._hide_to_tray)
+        # 背景自動檢查更新(有節流,一天最多打一次 API),晚一點跑避免搶啟動資源
+        self.root.after(2000, self._maybe_auto_check_update)
 
     # --- UI 建構 ------------------------------------------------------------
 
@@ -234,6 +241,7 @@ class PwmgrApp:
         menubar.add_cascade(label="OTP", menu=otp_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="檢查更新...", command=self._check_for_updates_manual)
         help_menu.add_command(label="關於 PWmgr", command=self._show_about)
         menubar.add_cascade(label="說明", menu=help_menu)
 
@@ -1436,10 +1444,89 @@ class PwmgrApp:
         except Exception:
             pass
 
+    # --- 更新 ------------------------------------------------------------------
+
+    def _check_for_updates_manual(self) -> None:
+        """選單「檢查更新...」— 手動觸發,查完一定跳對話框(有或沒有新版都跳)。"""
+        self._set_status("正在檢查更新...")
+
+        def worker() -> None:
+            avail = updater.check_for_update()
+            self.root.after(0, self._on_manual_update_checked, avail)
+
+        threading.Thread(target=worker, daemon=True, name="pwmgr-update-check").start()
+
+    def _on_manual_update_checked(self, avail: UpdateInfo | None) -> None:
+        self._set_status("")
+        if avail is None:
+            messagebox.showinfo("檢查更新", f"目前已是最新版本(v{APP_VERSION})。")
+            return
+        if messagebox.askyesno(
+            "檢查更新",
+            f"發現新版本 v{avail.version}(目前 v{APP_VERSION}),是否立即更新?",
+        ):
+            self._start_update(avail)
+
+    def _maybe_auto_check_update(self) -> None:
+        """啟動時的背景自動檢查——一天最多打一次 API,有新版只用 tray 通知,不彈窗。"""
+        last_check = otp_settings.get_update_last_check_ts()
+        if time.time() - last_check < UPDATE_AUTO_CHECK_INTERVAL_SECONDS:
+            return
+
+        def worker() -> None:
+            avail = updater.check_for_update()
+            self.root.after(0, self._on_auto_update_checked, avail)
+
+        threading.Thread(target=worker, daemon=True, name="pwmgr-update-autocheck").start()
+
+    def _on_auto_update_checked(self, avail: UpdateInfo | None) -> None:
+        otp_settings.set_update_last_check_ts(time.time())
+        if avail is None:
+            return
+        try:
+            self._tray.notify(
+                "PWmgr 有新版本",
+                f"v{avail.version} 已釋出,到「說明 → 檢查更新」安裝。",
+            )
+        except Exception:
+            pass
+
+    def _start_update(self, avail: UpdateInfo) -> None:
+        """使用者確認要更新。開發模式(非 frozen)沒有 exe 可換,改開瀏覽器。
+
+        打包模式:找同層的 PWmgrSetup.exe,丟給它 ``--update``(在獨立 process
+        跑,PWmgr.exe 結束後才不會有檔案被鎖住的問題),自己隨即結束。
+        """
+        if not getattr(sys, "frozen", False):
+            webbrowser.open(avail.release_url)
+            return
+
+        setup_exe = Path(sys.executable).resolve().parent / "PWmgrSetup.exe"
+        if not setup_exe.exists():
+            messagebox.showwarning(
+                "檢查更新",
+                f"找不到 {setup_exe.name},請手動到 Release 頁下載最新版本。",
+            )
+            webbrowser.open(avail.release_url)
+            return
+
+        try:
+            subprocess.Popen(
+                [str(setup_exe), "--update"],
+                cwd=str(setup_exe.parent),
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as e:
+            messagebox.showerror("檢查更新", f"啟動更新程式失敗: {e}")
+            return
+
+        self._do_quit()
+
     def _show_about(self) -> None:
         messagebox.showinfo(
             "關於 PWmgr",
             "PWmgr — 本機密碼管理員\n\n"
+            f"版本: v{APP_VERSION}\n\n"
             "密碼儲存於 Windows Credential Manager(OS keyring)。\n"
             "OS 帳號登入即為認證;不另設主密碼。\n\n"
             f"資料目錄: {app_dir()}",

@@ -105,18 +105,32 @@ def python_executable() -> str:
     打包後(frozen):
       - 若目前執行的是 `PWmgr.exe` 本體(GUI 與 native host 共用,見
         `pwmgr/__main__.py` 的 `--native` 分流),回傳自己。
-      - 若目前執行的是 `PWmgrSetup.exe`(安裝器),回傳同層 `PWmgr\\` 資料夾
-        裡的 `PWmgr.exe`。PWmgr 是 onedir,exe 在子目錄,不是直接放在
-        `dist\\` 根目錄。
-        ⚠ 此處 `PWmgr` 子目錄名必須與 `packaging\\build.py` 的 `--name PWmgr`
-        保持一致;改名後要同步。
+      - 若目前執行的是 `PWmgrSetup.exe`(安裝器),找同層的 `PWmgr.exe`。
+        正式發布的 release zip(`release.yml` 打包 `dist/PWmgr/*`,見
+        `Package release assets` step)跟 README「打包成 exe 分發」的安裝
+        說明都是**攤平**佈局——`PWmgr.exe`、`_internal\\`、`chrome_extension\\`
+        跟 `PWmgrSetup.exe` 全部同一層,不是嵌套的 `PWmgr\\` 子資料夾。
+        優先找攤平位置;找不到才退回找 `PWmgr\\PWmgr.exe`,對應本機直接對
+        `packaging\\build.py` 的原始 `dist\\` 輸出測試、還沒手動攤平/打包成
+        zip 的情境(`dist\\PWmgr\\PWmgr.exe` + `dist\\PWmgrSetup.exe`)。
+        兩個位置都找不到檔案時,回傳攤平猜測——正式發布是常態,錯誤訊息至少
+        會指向使用者實際應該有的路徑。
+        ⚠ 退回的巢狀子目錄名若真的用到,必須與 `packaging\\build.py` 的
+        `--name PWmgr` 保持一致;改名後要同步。
     """
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).resolve()
         if exe.name == "PWmgr.exe":
             return str(exe)
-        # PWmgrSetup.exe → 同層 PWmgr\ 資料夾裡的 PWmgr.exe
-        return str(exe.parent / "PWmgr" / "PWmgr.exe")
+        # PWmgrSetup.exe → 正式發布 / README 安裝流程是攤平佈局,優先找同層。
+        flat = exe.parent / "PWmgr.exe"
+        if flat.exists():
+            return str(flat)
+        # 退回巢狀佈局(本機直接跑 packaging/build.py 的原始 dist/ 輸出)。
+        nested = exe.parent / "PWmgr" / "PWmgr.exe"
+        if nested.exists():
+            return str(nested)
+        return str(flat)
     return sys.executable
 
 
