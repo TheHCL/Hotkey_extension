@@ -5,4 +5,4 @@
 (更新檢查是拿這個字串跟 GitHub Release 的 tag_name 比,不是比對 zip 內容)。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
