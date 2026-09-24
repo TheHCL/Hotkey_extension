@@ -845,14 +845,35 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       const tabId = msg.tabId;
       const code = String(msg.code || "");
+      // 除錯用:把每次 fillOtp 的最終結果(不管成功失敗)都寫進 pwmgr.log,
+      // 因為 popup 關掉/service worker 被 Chrome 回收後,DevTools console 的 log
+      // 就永久消失了 —— dev 事後只能靠這份 log 檔回溯剛剛到底發生什麼事。
+      const finish = (result, extra) => {
+        let url = null;
+        try {
+          url = extra && extra.url;
+        } catch (_) {}
+        reportError(
+          "otp_fill_debug",
+          `tabId=${tabId} code=${code || "(empty)"} result=${JSON.stringify(result)}`,
+          null,
+          url
+        );
+        sendResponse(result);
+      };
       if (!Number.isInteger(tabId)) {
-        sendResponse({ ok: false, code: "BAD_TAB_ID" });
+        finish({ ok: false, code: "BAD_TAB_ID" });
         return;
       }
       if (!code) {
-        sendResponse({ ok: false, code: "EMPTY_CODE" });
+        finish({ ok: false, code: "EMPTY_CODE" });
         return;
       }
+      let tabUrl = null;
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        tabUrl = tab && tab.url;
+      } catch (_) {}
       try {
         // 注意:一定要把 content script 回傳的實際結果轉發回去,不能收到訊息
         // 沒 throw 就直接回 { ok: true } —— sendMessage 不 throw 只代表訊息送達,
@@ -861,9 +882,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         // 「已填入」。
         const r = await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
         if (r && typeof r === "object") {
-          sendResponse(r);
+          finish(r, { url: tabUrl });
         } else {
-          sendResponse({ ok: false, code: "EMPTY_RESPONSE", error: "content script 沒回傳結果" });
+          finish({ ok: false, code: "EMPTY_RESPONSE", error: "content script 沒回傳結果" }, { url: tabUrl });
         }
       } catch (e) {
         // 多半是「Could not establish connection. Receiving end does not exist.」
@@ -879,22 +900,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const filled = flat.find((r) => r && r.ok);
           if (filled) {
             console.log("[pwmgr] fillOtp fallback (inline) success:", filled);
-            sendResponse({ ok: true, source: "fallback_inline", filled });
+            finish({ ok: true, source: "fallback_inline", filled }, { url: tabUrl });
             return;
           }
           const errResult = flat.find((r) => r && !r.ok);
           if (errResult) {
-            sendResponse({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error });
+            finish({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error }, { url: tabUrl });
             return;
           }
-          sendResponse({ ok: false, code: "FILL_FAIL", error: "OTP fallback 沒回傳結果" });
+          finish({ ok: false, code: "FILL_FAIL", error: "OTP fallback 沒回傳結果(frames=" + (results || []).length + ")" }, { url: tabUrl });
         } catch (e2) {
           // executeScript 也失敗(tabId 失效 / 非 http(s) / 權限不足)
-          sendResponse({
-            ok: false,
-            code: "FORWARD_FAIL",
-            error: `send: ${firstError} | inline: ${(e2 && e2.message) || String(e2)}`,
-          });
+          finish(
+            {
+              ok: false,
+              code: "FORWARD_FAIL",
+              error: `send: ${firstError} | inline: ${(e2 && e2.message) || String(e2)}`,
+            },
+            { url: tabUrl }
+          );
         }
       }
     })();
