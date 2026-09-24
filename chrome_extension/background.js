@@ -198,7 +198,7 @@ function scheduleExecuteScriptFill(tabId, username, password) {
 //   { files: [...] } 重新注入(Chrome 限制),所以改成 inline func 直接
 //   跑 OTP box 偵測 + 填入邏輯,繞過 listener。
 //
-// 邏輯跟 content.js 的 fillOtp() 對齊(Dell-specific otpBox class + 6 格 + tail number 排序);
+// 邏輯跟 content.js 的 fillOtp() 對齊(Dell otpBox 多格 + AMD/Okta 單一 passcode 欄位);
 // 兩邊需要同步改。實務上 OTP 邏輯變動頻率很低,duplication cost 可接受。
 
 async function otpFillFnExecutedScript(code) {
@@ -210,46 +210,67 @@ async function otpFillFnExecutedScript(code) {
   const otpBoxes = Array.from(
     document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
   ).filter(isUsable);
-  if (otpBoxes.length < 4) {
-    return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class)" };
-  }
-  // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
-  const getTailNum = (el) => {
-    const m = (el.id || "").match(/(\d+)\s*$/);
-    return m ? parseInt(m[1], 10) : 0;
-  };
-  otpBoxes.sort((a, b) => {
-    const ai = getTailNum(a);
-    const bi = getTailNum(b);
-    if (ai > 0 && bi > 0) return ai - bi;
-    const pos = a.compareDocumentPosition(b);
-    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-    return 0;
-  });
   const chars = String(code || "").replace(/\D/g, "").split("");
   if (chars.length === 0) {
     return { ok: false, code: "EMPTY_CODE", error: "code 沒有有效數字" };
   }
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
-  let filledCount = 0;
-  const n = Math.min(otpBoxes.length, chars.length);
-  for (let i = 0; i < n; i++) {
-    const el = otpBoxes[i];
-    const before = el.value;
-    setter.call(el, chars[i]);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (el.value === chars[i] && before !== chars[i]) filledCount++;
+
+  if (otpBoxes.length >= 4) {
+    // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
+    const getTailNum = (el) => {
+      const m = (el.id || "").match(/(\d+)\s*$/);
+      return m ? parseInt(m[1], 10) : 0;
+    };
+    otpBoxes.sort((a, b) => {
+      const ai = getTailNum(a);
+      const bi = getTailNum(b);
+      if (ai > 0 && bi > 0) return ai - bi;
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    let filledCount = 0;
+    const n = Math.min(otpBoxes.length, chars.length);
+    for (let i = 0; i < n; i++) {
+      const el = otpBoxes[i];
+      const before = el.value;
+      setter.call(el, chars[i]);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (el.value === chars[i] && before !== chars[i]) filledCount++;
+    }
+    const last = otpBoxes[n - 1];
+    if (last) {
+      try { last.focus(); } catch (_) {}
+    }
+    if (filledCount === 0) {
+      return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: otpBoxes.length };
+    }
+    return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
   }
-  const last = otpBoxes[n - 1];
-  if (last) {
-    try { last.focus(); } catch (_) {}
+
+  // AMD / Okta 風格單一輸入框(name/id 含 "passcode" 或 "otp"):完整 code 一次填入
+  const singleCandidates = Array.from(
+    document.querySelectorAll(
+      'input[name*="passcode" i], input[id*="passcode" i], input[name*="otp" i], input[id*="otp" i]'
+    )
+  ).filter((el) => isUsable(el) && (el.type === "text" || !el.type) && el.type !== "password");
+  if (singleCandidates.length === 0) {
+    return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class 或 passcode 欄位)" };
   }
-  if (filledCount === 0) {
-    return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: otpBoxes.length };
+  const el = singleCandidates[0];
+  const before = el.value;
+  const full = chars.join("");
+  setter.call(el, full);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  try { el.focus(); } catch (_) {}
+  if (el.value !== full || before === full) {
+    return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: 1 };
   }
-  return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
+  return { ok: true, filled: 1, total: 1, code: full };
 }
 // 各 tabId 的 loginTriggerPending 自動清除 timer(service worker 重啟會掉,
 let loginTriggerTimers = {}; // tabId -> setTimeout handle
@@ -833,8 +854,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       try {
-        await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
-        sendResponse({ ok: true });
+        // 注意:一定要把 content script 回傳的實際結果轉發回去,不能收到訊息
+        // 沒 throw 就直接回 { ok: true } —— sendMessage 不 throw 只代表訊息送達,
+        // 不代表 content script 真的找到欄位、成功填入(它可能回 NOT_FOUND /
+        // FILL_NOOP)。之前這裡忽略了回傳值,導致頁面沒填成功時 popup 仍顯示
+        // 「已填入」。
+        const r = await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
+        if (r && typeof r === "object") {
+          sendResponse(r);
+        } else {
+          sendResponse({ ok: false, code: "EMPTY_RESPONSE", error: "content script 沒回傳結果" });
+        }
       } catch (e) {
         // 多半是「Could not establish connection. Receiving end does not exist.」
         // — content script listener 被 reload 踢掉。fallback:直接在 page context 跑 OTP 填入。
