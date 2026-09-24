@@ -454,8 +454,17 @@
     console.log(`[pwmgr] 已填入 ${filled} 個密碼欄位`);
   }
 
+  // 注意:querySelectorAll("input") 若不限制 type,會連 type="submit"/"button" 這種
+  // 按鈕都一起抓進來 —— 這類按鈕的 value 屬性其實是顯示文字(如「Verify」),
+  // 一旦被誤判成「username 欄位」寫入 setValue,按鈕文字就會被換成帳號 email。
+  // 只挑文字型 input(text/email/tel/url/search/未指定 type),排除 submit/button/
+  // checkbox/radio/hidden/file/image/reset 等非文字型。
   function fillUsernameOnly(username) {
-    const allInputs = Array.from(document.querySelectorAll("input"));
+    const allInputs = Array.from(
+      document.querySelectorAll(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="search"], input:not([type])'
+      )
+    );
     const usableList = allInputs.filter((el) => isUsable(el) && !looksLikePasswordField(el) && !looksLikeCaptchaField(el));
     console.log("[pwmgr] fillUsernameOnly candidates", usableList.length, "/ total inputs:", allInputs.length);
     if (allInputs.length > 0 && usableList.length === 0) {
