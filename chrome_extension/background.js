@@ -828,31 +828,31 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "fillOtp") {
-    // popup 拿到 OTP code 後,要求 background 把 code 轉發到指定 tab 的 content script。
-    // 為什麼走 background 不用 popup 直接 chrome.tabs.sendMessage:
-    //   - popup 可能在按按鈕時 user 已關掉 → chrome.tabs.sendMessage 仍可,但
-    //     tabId 一致性檢查放 background 比較清楚
-    //   - native host 那邊 getOtp 是 popup→background→native → resp 回 popup,
-    //     但「把 code 寫進 input」是 page-side 動作,需要 content script 介入
+    // popup 拿到 OTP code 後,要求 background 把 code 寫進指定 tab 的頁面。
     //
-    // Fallback path(extension reload 後):Chrome MV3 的 chrome://extensions Reload 會
-    // 把已注入分頁的 content script 整個踢掉,只有下次 page reload 才會重新注入。
-    // 此時 popup 點 OTP → content script listener 不在 → sendMessage throw。
-    // Manifest 宣告的 content script 無法用 chrome.scripting.executeScript { files: [...] }
-    // 重新注入(Chrome 限制),所以 fallback 改成把 OTP 填入邏輯 inline 成 func 直接用
-    // executeScript { func, args } 跑在 page context。跟 fillFnExecutedScript 同樣 pattern,
-    // 詳見 otpFillFnExecutedScript 函式上方註解。
+    // 為什麼一律走 chrome.scripting.executeScript({allFrames:true}) 而不是
+    // chrome.tabs.sendMessage(tabId, ...) 廣播給 content script:
+    //   OTP 驗證碼頁常見多個 frame(例如 Okta 的 discovery/device-fingerprint
+    //   iframe)。content_scripts 設定是 all_frames:true,所以每個 frame 都會有
+    //   一份 fillOtp 的 chrome.runtime.onMessage listener。sendMessage 沒指定
+    //   frameId 時會廣播給所有 frame,但只有「第一個回應」會被採用——如果不相關
+    //   的 frame(例如某個追蹤用 iframe 裡剛好有欄位 name/id 含 "otp" 之類的
+    //   子字串)比真正的驗證碼頁 frame 先回應 NOT_FOUND 或誤填了不相關欄位,
+    //   popup 就會顯示「已填入」但其實真正看得到的欄位完全沒被寫入 —— 這正是
+    //   實測遇到的「popup 說已填入,網頁上卻沒變化」。
+    //
+    //   executeScript({allFrames:true}) 則會回傳「每個 frame各自的執行結果」
+    //   陣列,我們可以明確挑出真正 ok:true 的那個 frame,不會被無關 frame 的
+    //   回應蓋掉。
     (async () => {
       const tabId = msg.tabId;
       const code = String(msg.code || "");
-      // 除錯用:把每次 fillOtp 的最終結果(不管成功失敗)都寫進 pwmgr.log,
-      // 因為 popup 關掉/service worker 被 Chrome 回收後,DevTools console 的 log
-      // 就永久消失了 —— dev 事後只能靠這份 log 檔回溯剛剛到底發生什麼事。
       const finish = (result, extra) => {
         let url = null;
         try {
           url = extra && extra.url;
         } catch (_) {}
+        console.log("[pwmgr] fillOtp finish:", result, "url=", url);
         reportError(
           "otp_fill_debug",
           `tabId=${tabId} code=${code || "(empty)"} result=${JSON.stringify(result)}`,
@@ -875,51 +875,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         tabUrl = tab && tab.url;
       } catch (_) {}
       try {
-        // 注意:一定要把 content script 回傳的實際結果轉發回去,不能收到訊息
-        // 沒 throw 就直接回 { ok: true } —— sendMessage 不 throw 只代表訊息送達,
-        // 不代表 content script 真的找到欄位、成功填入(它可能回 NOT_FOUND /
-        // FILL_NOOP)。之前這裡忽略了回傳值,導致頁面沒填成功時 popup 仍顯示
-        // 「已填入」。
-        const r = await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
-        if (r && typeof r === "object") {
-          finish(r, { url: tabUrl });
-        } else {
-          finish({ ok: false, code: "EMPTY_RESPONSE", error: "content script 沒回傳結果" }, { url: tabUrl });
+        const results = await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          func: otpFillFnExecutedScript,
+          args: [code],
+        });
+        const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+        console.log("[pwmgr] fillOtp per-frame results:", flat);
+        const filled = flat.find((r) => r && r.ok);
+        if (filled) {
+          finish({ ok: true, ...filled }, { url: tabUrl });
+          return;
         }
+        const errResult = flat.find((r) => r && !r.ok);
+        if (errResult) {
+          finish({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error }, { url: tabUrl });
+          return;
+        }
+        finish(
+          { ok: false, code: "FILL_FAIL", error: "沒有任何 frame 回傳結果(frames=" + (results || []).length + ")" },
+          { url: tabUrl }
+        );
       } catch (e) {
-        // 多半是「Could not establish connection. Receiving end does not exist.」
-        // — content script listener 被 reload 踢掉。fallback:直接在 page context 跑 OTP 填入。
-        const firstError = e && e.message ? e.message : String(e);
-        try {
-          const results = await chrome.scripting.executeScript({
-            target: { tabId, allFrames: true },
-            func: otpFillFnExecutedScript,
-            args: [code],
-          });
-          const flat = (results || []).map((r) => r && r.result).filter(Boolean);
-          const filled = flat.find((r) => r && r.ok);
-          if (filled) {
-            console.log("[pwmgr] fillOtp fallback (inline) success:", filled);
-            finish({ ok: true, source: "fallback_inline", filled }, { url: tabUrl });
-            return;
-          }
-          const errResult = flat.find((r) => r && !r.ok);
-          if (errResult) {
-            finish({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error }, { url: tabUrl });
-            return;
-          }
-          finish({ ok: false, code: "FILL_FAIL", error: "OTP fallback 沒回傳結果(frames=" + (results || []).length + ")" }, { url: tabUrl });
-        } catch (e2) {
-          // executeScript 也失敗(tabId 失效 / 非 http(s) / 權限不足)
-          finish(
-            {
-              ok: false,
-              code: "FORWARD_FAIL",
-              error: `send: ${firstError} | inline: ${(e2 && e2.message) || String(e2)}`,
-            },
-            { url: tabUrl }
-          );
-        }
+        // executeScript 失敗(tabId 失效 / 非 http(s) / 權限不足)
+        finish({ ok: false, code: "FORWARD_FAIL", error: (e && e.message) || String(e) }, { url: tabUrl });
       }
     })();
     return true;

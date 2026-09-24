@@ -1014,17 +1014,12 @@
     return false;
   });
 
-  // background 把 OTP code 轉發過來 → 寫進 boxes
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (!msg || msg.type !== "fillOtp") return false;
-    try {
-      const r = fillOtp(msg.code);
-      sendResponse(r);
-    } catch (e) {
-      sendResponse({ ok: false, code: "EXCEPTION", error: e && e.message || String(e) });
-    }
-    return false;
-  });
+  // 注意:實際填入 OTP 已改由 background.js 用 chrome.scripting.executeScript
+  // ({allFrames:true}) 直接注入 otpFillFnExecutedScript 執行(見 background.js
+  // fillOtp handler 上方註解——sendMessage 廣播給多個 frame 時只有一個回應會被
+  // 採用,容易被無關 frame 搶答蓋掉真正的填入結果),這裡不再需要對應的
+  // chrome.runtime.onMessage listener。fillOtp() 函式本身還留著給
+  // window.__pwmgrDoFill__ 之類的除錯/未來用途參考。
 
   // 暴露 fillForm 給 executeScript 直接呼叫,繞過 listener race / storage race。
   // 用 unique-ish key 降低被其他 extension 誤觸的風險(並非真正安全隔離)。
