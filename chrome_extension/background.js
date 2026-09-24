@@ -198,7 +198,7 @@ function scheduleExecuteScriptFill(tabId, username, password) {
 //   { files: [...] } 重新注入(Chrome 限制),所以改成 inline func 直接
 //   跑 OTP box 偵測 + 填入邏輯,繞過 listener。
 //
-// 邏輯跟 content.js 的 fillOtp() 對齊(Dell-specific otpBox class + 6 格 + tail number 排序);
+// 邏輯跟 content.js 的 fillOtp() 對齊(Dell otpBox 多格 + AMD/Okta 單一 passcode 欄位);
 // 兩邊需要同步改。實務上 OTP 邏輯變動頻率很低,duplication cost 可接受。
 
 async function otpFillFnExecutedScript(code) {
@@ -210,47 +210,158 @@ async function otpFillFnExecutedScript(code) {
   const otpBoxes = Array.from(
     document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
   ).filter(isUsable);
-  if (otpBoxes.length < 4) {
-    return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class)" };
-  }
-  // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
-  const getTailNum = (el) => {
-    const m = (el.id || "").match(/(\d+)\s*$/);
-    return m ? parseInt(m[1], 10) : 0;
-  };
-  otpBoxes.sort((a, b) => {
-    const ai = getTailNum(a);
-    const bi = getTailNum(b);
-    if (ai > 0 && bi > 0) return ai - bi;
-    const pos = a.compareDocumentPosition(b);
-    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-    return 0;
-  });
   const chars = String(code || "").replace(/\D/g, "").split("");
   if (chars.length === 0) {
     return { ok: false, code: "EMPTY_CODE", error: "code 沒有有效數字" };
   }
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
-  let filledCount = 0;
-  const n = Math.min(otpBoxes.length, chars.length);
-  for (let i = 0; i < n; i++) {
-    const el = otpBoxes[i];
-    const before = el.value;
-    setter.call(el, chars[i]);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (el.value === chars[i] && before !== chars[i]) filledCount++;
+
+  if (otpBoxes.length >= 4) {
+    // 排序:id 末段數字優先(Dell 1..N);fallback DOM 順序
+    const getTailNum = (el) => {
+      const m = (el.id || "").match(/(\d+)\s*$/);
+      return m ? parseInt(m[1], 10) : 0;
+    };
+    otpBoxes.sort((a, b) => {
+      const ai = getTailNum(a);
+      const bi = getTailNum(b);
+      if (ai > 0 && bi > 0) return ai - bi;
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    let filledCount = 0;
+    const n = Math.min(otpBoxes.length, chars.length);
+    for (let i = 0; i < n; i++) {
+      const el = otpBoxes[i];
+      const before = el.value;
+      setter.call(el, chars[i]);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (el.value === chars[i] && before !== chars[i]) filledCount++;
+    }
+    const last = otpBoxes[n - 1];
+    if (last) {
+      try { last.focus(); } catch (_) {}
+    }
+    if (filledCount === 0) {
+      return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: otpBoxes.length };
+    }
+    return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
   }
-  const last = otpBoxes[n - 1];
-  if (last) {
-    try { last.focus(); } catch (_) {}
+
+  // AMD / Okta 風格單一輸入框(name/id 含 "passcode" 或 "otp"):完整 code 一次填入
+  const singleCandidates = Array.from(
+    document.querySelectorAll(
+      'input[name*="passcode" i], input[id*="passcode" i], input[name*="otp" i], input[id*="otp" i]'
+    )
+  ).filter((el) => isUsable(el) && (el.type === "text" || !el.type) && el.type !== "password");
+  if (singleCandidates.length === 0) {
+    return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class 或 passcode 欄位)" };
   }
-  if (filledCount === 0) {
-    return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: otpBoxes.length };
+  const el = singleCandidates[0];
+  const before = el.value;
+  const full = chars.join("");
+  setter.call(el, full);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  try { el.focus(); } catch (_) {}
+  if (el.value !== full || before === full) {
+    return { ok: false, code: "FILL_NOOP", error: "OTP 輸入框已存在值或拒絕寫入", total: 1 };
   }
-  return { ok: true, filled: filledCount, total: otpBoxes.length, code: chars.join("") };
+  return { ok: true, filled: 1, total: 1, code: full };
 }
+
+// 純偵測用(不寫入任何東西):跟 otpFillFnExecutedScript 認同一組欄位,只回報
+// 「頁面上有沒有空的 OTP 欄位」,給 scheduleOtpAutoFill 拿來判斷要不要開始跟
+// Outlook 要碼,避免每個 tick 都白白呼叫一次 Outlook COM。
+function otpDetectFnExecutedScript() {
+  const isUsable = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const otpBoxes = Array.from(
+    document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
+  ).filter(isUsable);
+  if (otpBoxes.length >= 4) {
+    return { found: true, kind: "boxes" };
+  }
+  const single = Array.from(
+    document.querySelectorAll(
+      'input[name*="passcode" i], input[id*="passcode" i], input[name*="otp" i], input[id*="otp" i]'
+    )
+  ).filter((el) => isUsable(el) && (el.type === "text" || !el.type) && el.type !== "password" && !el.value);
+  return single.length > 0 ? { found: true, kind: "single" } : { found: false };
+}
+
+// --- launchAndFill 之後自動偵測 + 自動填入 OTP -------------------------------
+//
+// 使用者決定:自動填入驗證碼後「不」自動按送出/Verify —— 誤填/信件過期時使用者
+// 還能自己檢查一下再手動送出,比全自動風險低。
+//
+// 為什麼要獨立排程,不能沿用 scheduleExecuteScriptFill 的 20 次/40 秒:
+//   帳密填完到 MFA 頁真正出現驗證碼欄位、Outlook 收到信,通常比帳密填入本身
+//   慢上不少(SSO redirect + mail 送達時間),所以給更長的偵測視窗(90 秒),
+//   但偵測本身很輕量(純 querySelectorAll,不呼叫 Outlook),真正拿到欄位才會
+//   觸發一次 getOtp,不會每個 tick 都打 Outlook COM。
+function scheduleOtpAutoFill(tabId) {
+  let stopped = false;
+  const maxAttempts = 30; // 每 3 秒一次,涵蓋 ~90 秒
+  let attempt = 0;
+
+  const tick = () => {
+    if (stopped) return;
+    attempt++;
+    chrome.scripting
+      .executeScript({ target: { tabId, allFrames: true }, func: otpDetectFnExecutedScript })
+      .then((results) => {
+        if (stopped) return;
+        const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+        const found = flat.find((r) => r && r.found);
+        if (found) {
+          stopped = true;
+          console.log("[pwmgr] auto-otp: 偵測到驗證碼欄位,開始跟 Outlook 要碼 (tab=" + tabId + ")");
+          autoFetchAndFillOtp(tabId);
+          return;
+        }
+        if (attempt >= maxAttempts) {
+          console.log("[pwmgr] auto-otp: 逾時未偵測到驗證碼欄位,放棄 (tab=" + tabId + ")");
+          return;
+        }
+        setTimeout(tick, 3000);
+      })
+      .catch(() => {
+        // tab 可能還沒 navigate 完 / 已關閉,略過這次繼續等下一輪
+        if (!stopped && attempt < maxAttempts) setTimeout(tick, 3000);
+      });
+  };
+  setTimeout(tick, 3000);
+}
+
+async function autoFetchAndFillOtp(tabId) {
+  try {
+    // poll_seconds=15:信件可能還在路上,給 Outlook 一點時間;master 開關關掉時
+    // native host 會直接回 OTP_DISABLED,這裡自然就跳過,不用額外檢查設定。
+    const resp = await sendNative({ type: "get_otp", poll_seconds: 15 }, 25000);
+    console.log("[pwmgr] auto-otp: getOtp resp=", resp);
+    if (!resp || !resp.ok || !resp.code) {
+      console.log("[pwmgr] auto-otp: 沒拿到 code,放棄自動填入(tab=" + tabId + ")");
+      return;
+    }
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: otpFillFnExecutedScript,
+      args: [resp.code],
+    });
+    const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+    console.log("[pwmgr] auto-otp: fill per-frame results=", flat, "tab=" + tabId);
+  } catch (e) {
+    console.log("[pwmgr] auto-otp: 例外", (e && e.message) || e, "tab=" + tabId);
+  }
+}
+
 // 各 tabId 的 loginTriggerPending 自動清除 timer(service worker 重啟會掉,
 let loginTriggerTimers = {}; // tabId -> setTimeout handle
 
@@ -807,65 +918,77 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "fillOtp") {
-    // popup 拿到 OTP code 後,要求 background 把 code 轉發到指定 tab 的 content script。
-    // 為什麼走 background 不用 popup 直接 chrome.tabs.sendMessage:
-    //   - popup 可能在按按鈕時 user 已關掉 → chrome.tabs.sendMessage 仍可,但
-    //     tabId 一致性檢查放 background 比較清楚
-    //   - native host 那邊 getOtp 是 popup→background→native → resp 回 popup,
-    //     但「把 code 寫進 input」是 page-side 動作,需要 content script 介入
+    // popup 拿到 OTP code 後,要求 background 把 code 寫進指定 tab 的頁面。
     //
-    // Fallback path(extension reload 後):Chrome MV3 的 chrome://extensions Reload 會
-    // 把已注入分頁的 content script 整個踢掉,只有下次 page reload 才會重新注入。
-    // 此時 popup 點 OTP → content script listener 不在 → sendMessage throw。
-    // Manifest 宣告的 content script 無法用 chrome.scripting.executeScript { files: [...] }
-    // 重新注入(Chrome 限制),所以 fallback 改成把 OTP 填入邏輯 inline 成 func 直接用
-    // executeScript { func, args } 跑在 page context。跟 fillFnExecutedScript 同樣 pattern,
-    // 詳見 otpFillFnExecutedScript 函式上方註解。
+    // 為什麼一律走 chrome.scripting.executeScript({allFrames:true}) 而不是
+    // chrome.tabs.sendMessage(tabId, ...) 廣播給 content script:
+    //   OTP 驗證碼頁常見多個 frame(例如 Okta 的 discovery/device-fingerprint
+    //   iframe)。content_scripts 設定是 all_frames:true,所以每個 frame 都會有
+    //   一份 fillOtp 的 chrome.runtime.onMessage listener。sendMessage 沒指定
+    //   frameId 時會廣播給所有 frame,但只有「第一個回應」會被採用——如果不相關
+    //   的 frame(例如某個追蹤用 iframe 裡剛好有欄位 name/id 含 "otp" 之類的
+    //   子字串)比真正的驗證碼頁 frame 先回應 NOT_FOUND 或誤填了不相關欄位,
+    //   popup 就會顯示「已填入」但其實真正看得到的欄位完全沒被寫入 —— 這正是
+    //   實測遇到的「popup 說已填入,網頁上卻沒變化」。
+    //
+    //   executeScript({allFrames:true}) 則會回傳「每個 frame各自的執行結果」
+    //   陣列,我們可以明確挑出真正 ok:true 的那個 frame,不會被無關 frame 的
+    //   回應蓋掉。
     (async () => {
       const tabId = msg.tabId;
       const code = String(msg.code || "");
+      const finish = (result, extra) => {
+        let url = null;
+        try {
+          url = extra && extra.url;
+        } catch (_) {}
+        console.log("[pwmgr] fillOtp finish:", result, "url=", url);
+        reportError(
+          "otp_fill_debug",
+          `tabId=${tabId} code=${code || "(empty)"} result=${JSON.stringify(result)}`,
+          null,
+          url
+        );
+        sendResponse(result);
+      };
       if (!Number.isInteger(tabId)) {
-        sendResponse({ ok: false, code: "BAD_TAB_ID" });
+        finish({ ok: false, code: "BAD_TAB_ID" });
         return;
       }
       if (!code) {
-        sendResponse({ ok: false, code: "EMPTY_CODE" });
+        finish({ ok: false, code: "EMPTY_CODE" });
         return;
       }
+      let tabUrl = null;
       try {
-        await chrome.tabs.sendMessage(tabId, { type: "fillOtp", code });
-        sendResponse({ ok: true });
-      } catch (e) {
-        // 多半是「Could not establish connection. Receiving end does not exist.」
-        // — content script listener 被 reload 踢掉。fallback:直接在 page context 跑 OTP 填入。
-        const firstError = e && e.message ? e.message : String(e);
-        try {
-          const results = await chrome.scripting.executeScript({
-            target: { tabId, allFrames: true },
-            func: otpFillFnExecutedScript,
-            args: [code],
-          });
-          const flat = (results || []).map((r) => r && r.result).filter(Boolean);
-          const filled = flat.find((r) => r && r.ok);
-          if (filled) {
-            console.log("[pwmgr] fillOtp fallback (inline) success:", filled);
-            sendResponse({ ok: true, source: "fallback_inline", filled });
-            return;
-          }
-          const errResult = flat.find((r) => r && !r.ok);
-          if (errResult) {
-            sendResponse({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error });
-            return;
-          }
-          sendResponse({ ok: false, code: "FILL_FAIL", error: "OTP fallback 沒回傳結果" });
-        } catch (e2) {
-          // executeScript 也失敗(tabId 失效 / 非 http(s) / 權限不足)
-          sendResponse({
-            ok: false,
-            code: "FORWARD_FAIL",
-            error: `send: ${firstError} | inline: ${(e2 && e2.message) || String(e2)}`,
-          });
+        const tab = await chrome.tabs.get(tabId);
+        tabUrl = tab && tab.url;
+      } catch (_) {}
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          func: otpFillFnExecutedScript,
+          args: [code],
+        });
+        const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+        console.log("[pwmgr] fillOtp per-frame results:", flat);
+        const filled = flat.find((r) => r && r.ok);
+        if (filled) {
+          finish({ ok: true, ...filled }, { url: tabUrl });
+          return;
         }
+        const errResult = flat.find((r) => r && !r.ok);
+        if (errResult) {
+          finish({ ok: false, code: errResult.code || "FILL_FAIL", error: errResult.error }, { url: tabUrl });
+          return;
+        }
+        finish(
+          { ok: false, code: "FILL_FAIL", error: "沒有任何 frame 回傳結果(frames=" + (results || []).length + ")" },
+          { url: tabUrl }
+        );
+      } catch (e) {
+        // executeScript 失敗(tabId 失效 / 非 http(s) / 權限不足)
+        finish({ ok: false, code: "FORWARD_FAIL", error: (e && e.message) || String(e) }, { url: tabUrl });
       }
     })();
     return true;
@@ -1087,6 +1210,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // 不依賴 onUpdated listener(listener 在 SW 卸載後 queue 內 events 處理不順)。
       // 每次 setTimeout 從 storage.local 讀 credentials(跨 SW 重啟一致)。
       scheduleExecuteScriptFill(newTab.id, fResp.entry.username, fResp.password);
+
+      // 帳密填完後可能還有 MFA/驗證碼頁(如 AMD Okta),獨立排程偵測 + 自動填入
+      // OTP(見 scheduleOtpAutoFill 上方註解)。只填入,不自動送出。
+      scheduleOtpAutoFill(newTab.id);
 
       console.log("[pwmgr] launchAndFill sending ok resp, tabId=", newTab.id);
       sendResponse({ ok: true, tabId: newTab.id });

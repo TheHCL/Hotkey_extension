@@ -454,8 +454,17 @@
     console.log(`[pwmgr] 已填入 ${filled} 個密碼欄位`);
   }
 
+  // 注意:querySelectorAll("input") 若不限制 type,會連 type="submit"/"button" 這種
+  // 按鈕都一起抓進來 —— 這類按鈕的 value 屬性其實是顯示文字(如「Verify」),
+  // 一旦被誤判成「username 欄位」寫入 setValue,按鈕文字就會被換成帳號 email。
+  // 只挑文字型 input(text/email/tel/url/search/未指定 type),排除 submit/button/
+  // checkbox/radio/hidden/file/image/reset 等非文字型。
   function fillUsernameOnly(username) {
-    const allInputs = Array.from(document.querySelectorAll("input"));
+    const allInputs = Array.from(
+      document.querySelectorAll(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="search"], input:not([type])'
+      )
+    );
     const usableList = allInputs.filter((el) => isUsable(el) && !looksLikePasswordField(el) && !looksLikeCaptchaField(el));
     console.log("[pwmgr] fillUsernameOnly candidates", usableList.length, "/ total inputs:", allInputs.length);
     if (allInputs.length > 0 && usableList.length === 0) {
@@ -877,7 +886,7 @@
     return false;
   });
 
-  // ===== OTP 自動填(Dell 風格 otpBox 多格輸入) =====================================
+  // ===== OTP 自動填(Dell 風格 otpBox 多格輸入 / AMD 風格單一 passcode 欄位) =========
   //
   // 偵測目標(Dell):
   //   <input class="otpBox ..." maxlength="1" type="tel" autocomplete="one-time-code">
@@ -912,18 +921,60 @@
     return sorted;
   }
 
+  // 偵測目標(AMD / Okta 風格單一輸入框):
+  //   <input type="text" name="credentials.passcode" id="input80" ...>
+  //   跟 Dell 的 6 格分開輸入不同,這種只有一格,完整 6 碼一次填進去。
+  //
+  // 用 name/id 含 "passcode" 判斷(Okta MFA widget 的慣用命名),
+  // 限定 type=text 且非 password,避免誤觸帳密欄位。
+  function findOtpSingleInput() {
+    const candidates = Array.from(
+      document.querySelectorAll(
+        'input[name*="passcode" i], input[id*="passcode" i], input[name*="otp" i], input[id*="otp" i]'
+      )
+    ).filter((el) => isUsable(el) && (el.type === "text" || !el.type) && el.type !== "password");
+    return candidates.length > 0 ? [candidates[0]] : [];
+  }
+
   function fillOtp(code) {
-    const boxes = findOtpBoxes();
+    let boxes = findOtpBoxes();
+    let singleField = false;
     if (boxes.length === 0) {
-      return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class)" };
+      boxes = findOtpSingleInput();
+      singleField = boxes.length > 0;
     }
-    // 過濾非數字,Dell OTP 一定是 6 位數;若 native host 回 alphanumeric 也安全(只取數字部分)
+    if (boxes.length === 0) {
+      return { ok: false, code: "NOT_FOUND", error: "頁面上找不到 OTP 輸入框(需要 otpBox class 或 passcode 欄位)" };
+    }
+    // 過濾非數字,OTP 一定是 6 位數;若 native host 回 alphanumeric 也安全(只取數字部分)
     const chars = String(code || "").replace(/\D/g, "").split("");
     if (chars.length === 0) {
       return { ok: false, code: "EMPTY_CODE", error: "code 沒有有效數字" };
     }
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
     let filledCount = 0;
+
+    if (singleField) {
+      // 單一輸入框:完整 code 一次填入同一格(不像 Dell 一格一碼)
+      const el = boxes[0];
+      const before = el.value;
+      const full = chars.join("");
+      setter.call(el, full);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (el.value === full && before !== full) filledCount = 1;
+      try { el.focus(); } catch (_) {}
+      if (filledCount === 0) {
+        return {
+          ok: false,
+          code: "FILL_NOOP",
+          error: "OTP 輸入框已存在值或拒絕寫入(可能已被 user 手動填過)",
+          total: 1,
+        };
+      }
+      return { ok: true, filled: 1, total: 1, code: full };
+    }
+
     const n = Math.min(boxes.length, chars.length);
     for (let i = 0; i < n; i++) {
       const el = boxes[i];
@@ -954,21 +1005,21 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || msg.type !== "detectOtp") return false;
     const boxes = findOtpBoxes();
-    sendResponse({ ok: true, found: boxes.length >= 4, count: boxes.length });
+    if (boxes.length >= 4) {
+      sendResponse({ ok: true, found: true, count: boxes.length });
+      return false;
+    }
+    const single = findOtpSingleInput();
+    sendResponse({ ok: true, found: single.length > 0, count: single.length });
     return false;
   });
 
-  // background 把 OTP code 轉發過來 → 寫進 boxes
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (!msg || msg.type !== "fillOtp") return false;
-    try {
-      const r = fillOtp(msg.code);
-      sendResponse(r);
-    } catch (e) {
-      sendResponse({ ok: false, code: "EXCEPTION", error: e && e.message || String(e) });
-    }
-    return false;
-  });
+  // 注意:實際填入 OTP 已改由 background.js 用 chrome.scripting.executeScript
+  // ({allFrames:true}) 直接注入 otpFillFnExecutedScript 執行(見 background.js
+  // fillOtp handler 上方註解——sendMessage 廣播給多個 frame 時只有一個回應會被
+  // 採用,容易被無關 frame 搶答蓋掉真正的填入結果),這裡不再需要對應的
+  // chrome.runtime.onMessage listener。fillOtp() 函式本身還留著給
+  // window.__pwmgrDoFill__ 之類的除錯/未來用途參考。
 
   // 暴露 fillForm 給 executeScript 直接呼叫,繞過 listener race / storage race。
   // 用 unique-ish key 降低被其他 extension 誤觸的風險(並非真正安全隔離)。
