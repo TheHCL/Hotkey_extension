@@ -105,6 +105,8 @@ OTP_SUBJECT_PATTERNS: list[str] = [
     # AMD(Okta MFA)一次性密碼信,subject 固定是中文「一次驗證碼」
     "一次驗證碼",
     "[External Mail] 一次驗證碼",
+    # AMD 英文網域另一種 subject 版本
+    "[External Mail] Your confirmation code",
 ]
 
 # 從信件 body 抽出 OTP code 的 regex。\b word boundary 避免 7 位電話誤判
