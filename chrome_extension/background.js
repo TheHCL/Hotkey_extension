@@ -272,6 +272,96 @@ async function otpFillFnExecutedScript(code) {
   }
   return { ok: true, filled: 1, total: 1, code: full };
 }
+
+// 純偵測用(不寫入任何東西):跟 otpFillFnExecutedScript 認同一組欄位,只回報
+// 「頁面上有沒有空的 OTP 欄位」,給 scheduleOtpAutoFill 拿來判斷要不要開始跟
+// Outlook 要碼,避免每個 tick 都白白呼叫一次 Outlook COM。
+function otpDetectFnExecutedScript() {
+  const isUsable = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const otpBoxes = Array.from(
+    document.querySelectorAll('input.otpBox, input[class~="otpBox"], input[class*="otpBox" i]')
+  ).filter(isUsable);
+  if (otpBoxes.length >= 4) {
+    return { found: true, kind: "boxes" };
+  }
+  const single = Array.from(
+    document.querySelectorAll(
+      'input[name*="passcode" i], input[id*="passcode" i], input[name*="otp" i], input[id*="otp" i]'
+    )
+  ).filter((el) => isUsable(el) && (el.type === "text" || !el.type) && el.type !== "password" && !el.value);
+  return single.length > 0 ? { found: true, kind: "single" } : { found: false };
+}
+
+// --- launchAndFill 之後自動偵測 + 自動填入 OTP -------------------------------
+//
+// 使用者決定:自動填入驗證碼後「不」自動按送出/Verify —— 誤填/信件過期時使用者
+// 還能自己檢查一下再手動送出,比全自動風險低。
+//
+// 為什麼要獨立排程,不能沿用 scheduleExecuteScriptFill 的 20 次/40 秒:
+//   帳密填完到 MFA 頁真正出現驗證碼欄位、Outlook 收到信,通常比帳密填入本身
+//   慢上不少(SSO redirect + mail 送達時間),所以給更長的偵測視窗(90 秒),
+//   但偵測本身很輕量(純 querySelectorAll,不呼叫 Outlook),真正拿到欄位才會
+//   觸發一次 getOtp,不會每個 tick 都打 Outlook COM。
+function scheduleOtpAutoFill(tabId) {
+  let stopped = false;
+  const maxAttempts = 30; // 每 3 秒一次,涵蓋 ~90 秒
+  let attempt = 0;
+
+  const tick = () => {
+    if (stopped) return;
+    attempt++;
+    chrome.scripting
+      .executeScript({ target: { tabId, allFrames: true }, func: otpDetectFnExecutedScript })
+      .then((results) => {
+        if (stopped) return;
+        const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+        const found = flat.find((r) => r && r.found);
+        if (found) {
+          stopped = true;
+          console.log("[pwmgr] auto-otp: 偵測到驗證碼欄位,開始跟 Outlook 要碼 (tab=" + tabId + ")");
+          autoFetchAndFillOtp(tabId);
+          return;
+        }
+        if (attempt >= maxAttempts) {
+          console.log("[pwmgr] auto-otp: 逾時未偵測到驗證碼欄位,放棄 (tab=" + tabId + ")");
+          return;
+        }
+        setTimeout(tick, 3000);
+      })
+      .catch(() => {
+        // tab 可能還沒 navigate 完 / 已關閉,略過這次繼續等下一輪
+        if (!stopped && attempt < maxAttempts) setTimeout(tick, 3000);
+      });
+  };
+  setTimeout(tick, 3000);
+}
+
+async function autoFetchAndFillOtp(tabId) {
+  try {
+    // poll_seconds=15:信件可能還在路上,給 Outlook 一點時間;master 開關關掉時
+    // native host 會直接回 OTP_DISABLED,這裡自然就跳過,不用額外檢查設定。
+    const resp = await sendNative({ type: "get_otp", poll_seconds: 15 }, 25000);
+    console.log("[pwmgr] auto-otp: getOtp resp=", resp);
+    if (!resp || !resp.ok || !resp.code) {
+      console.log("[pwmgr] auto-otp: 沒拿到 code,放棄自動填入(tab=" + tabId + ")");
+      return;
+    }
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: otpFillFnExecutedScript,
+      args: [resp.code],
+    });
+    const flat = (results || []).map((r) => r && r.result).filter(Boolean);
+    console.log("[pwmgr] auto-otp: fill per-frame results=", flat, "tab=" + tabId);
+  } catch (e) {
+    console.log("[pwmgr] auto-otp: 例外", (e && e.message) || e, "tab=" + tabId);
+  }
+}
+
 // 各 tabId 的 loginTriggerPending 自動清除 timer(service worker 重啟會掉,
 let loginTriggerTimers = {}; // tabId -> setTimeout handle
 
@@ -1120,6 +1210,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // 不依賴 onUpdated listener(listener 在 SW 卸載後 queue 內 events 處理不順)。
       // 每次 setTimeout 從 storage.local 讀 credentials(跨 SW 重啟一致)。
       scheduleExecuteScriptFill(newTab.id, fResp.entry.username, fResp.password);
+
+      // 帳密填完後可能還有 MFA/驗證碼頁(如 AMD Okta),獨立排程偵測 + 自動填入
+      // OTP(見 scheduleOtpAutoFill 上方註解)。只填入,不自動送出。
+      scheduleOtpAutoFill(newTab.id);
 
       console.log("[pwmgr] launchAndFill sending ok resp, tabId=", newTab.id);
       sendResponse({ ok: true, tabId: newTab.id });
